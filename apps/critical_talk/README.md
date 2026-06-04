@@ -4,6 +4,14 @@ Cliente Flutter para a etapa 1 do Critical Talk, focado inicialmente em Linux de
 
 ## Escopo atual
 
+Esta versao agora tambem possui uma base local de usuario com:
+
+- autenticacao por `user_name` + senha forte;
+- cadastro sem email;
+- identificador fixo opaco mostrado na primeira criacao;
+- perfil local editavel com avatar/GIF e banner/GIF;
+- persistencia local criptografada.
+
 Esta versao implementa o layout base da sala:
 
 - navegacao lateral;
@@ -32,7 +40,10 @@ O painel de voz agora tambem suporta:
 - troca de saida padrao;
 - mute local no cliente;
 - indicador visual de atividade de fala para o usuario local;
+- retorno local da propria voz para testar captacao e clareza;
 - bot de teste emitindo audio no sistema para validar a saida selecionada.
+
+Voz em tempo real entre participantes continua como a prioridade tecnica seguinte, mas a validacao completa ficou pendente de teste com um segundo usuario conectado.
 
 Chat em tempo real, captura/publicacao de voz e trilhas reais entram nas proximas fatias.
 

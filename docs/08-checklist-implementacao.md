@@ -23,9 +23,24 @@ Legenda:
 ### Base
 
 - `[x]` Layout principal da sala
-- `[ ]` Tela de entrada em sala
+- `[x]` Tela de autenticacao local
 - `[ ]` Entrada por codigo/convite
-- `[ ]` Persistencia local de configuracoes
+- `[x]` Persistencia local criptografada de usuario
+
+### Usuario e seguranca
+
+- `[x]` Autenticacao local sem email
+- `[x]` Login por `user_name` + senha forte
+- `[x]` Validacao de senha minima e complexidade
+- `[x]` ID fixo opaco gerado com hash + entropia complementar
+- `[x]` Exibicao da chave inicial do usuario no primeiro cadastro
+- `[x]` Senha derivada com Argon2id
+- `[x]` Blob local de usuario criptografado
+- `[x]` Objeto usuario com `userId`, `userName` e perfil
+- `[x]` Campo `profileIds` reservado para futura multiperfil
+- `[ ]` Integracao da autenticacao com backend
+- `[ ]` Tokens `access` e `refresh`
+- `[ ]` Entrada em sala por convite autenticado
 
 ### Comunicacao
 
@@ -57,11 +72,11 @@ Legenda:
 
 ### Personalizacao
 
-- `[ ]` Troca de nick funcional
-- `[ ]` Foto de perfil funcional
-- `[ ]` Banner funcional
-- `[ ]` Crop de imagem
-- `[ ]` Suporte a GIF no perfil
+- `[x]` Troca de nick funcional
+- `[x]` Foto de perfil funcional
+- `[x]` Banner funcional
+- `[x]` Crop visual de banner
+- `[x]` Suporte a GIF no perfil
 
 ## Etapa 2
 
@@ -123,6 +138,13 @@ Legenda:
 
 ## Checklist especifico de voz
 
+### Prioridade atual
+
+- `[~]` Prioridade imediata quando houver apoio de um segundo usuario: validar voz em tempo real entre 2 participantes
+- `[!]` Bloqueado no momento por indisponibilidade de segundo usuario para teste de chamada real
+- `[ ]` Rodar teste ponta a ponta com 2 clientes conectados na mesma sala
+- `[ ]` Confirmar latencia, estabilidade, mute/unmute e indicador de fala remoto em chamada real
+
 ### Ambiente Linux
 
 - `[x]` `pulseaudio` presente
@@ -142,6 +164,7 @@ Legenda:
 - `[x]` Selecionar saida ativa
 - `[x]` Bot local de teste emitindo audio no sistema
 - `[x]` Indicador visual de fala local
+- `[x]` Retorno local da propria voz para teste
 - `[ ]` Medidor de entrada
 - `[ ]` Captura de audio local
 - `[ ]` Publicacao de audio no SFU
@@ -155,5 +178,5 @@ Legenda:
 - `[ ]` Subir instancia local de teste
 - `[ ]` Gerar tokens de acesso
 - `[ ]` Entrar/sair de sala com voz
-- `[ ]` Teste com 2 clientes Linux
+- `[!]` Teste com 2 clientes Linux
 - `[ ]` Teste com Linux + Android

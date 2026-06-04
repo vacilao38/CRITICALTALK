@@ -15,6 +15,7 @@ O foco do projeto e ser leve, privado e confortavel em dispositivos simples, fun
 - [Ambiente de desenvolvimento](docs/06-ambiente-desenvolvimento.md)
 - [Audio no Linux](docs/07-audio-linux.md)
 - [Checklist de implementacao](docs/08-checklist-implementacao.md)
+- [Usuarios e seguranca](docs/09-usuarios-seguranca.md)
 
 ## Prioridade atual
 

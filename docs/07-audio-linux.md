@@ -49,6 +49,18 @@ Nao estavam instalados quando o ambiente foi auditado:
 - Estrategia inicial: self-hosted para desenvolvimento e testes fechados.
 - Opcao managed caso precise terceirizar operacao: LiveKit Cloud.
 
+## Estado atual do projeto
+
+Ja conseguimos validar localmente no cliente Linux:
+
+- escolha de microfone e saida;
+- mute local;
+- indicador visual de fala local;
+- retorno local da propria voz;
+- audio de teste por bot local.
+
+O proximo passo prioritario continua sendo a voz em tempo real entre participantes, mas essa etapa ficou temporariamente bloqueada ate haver um segundo usuario disponivel para teste real de chamada.
+
 ## Alternativas pagas avaliadas
 
 - Daily: boa opcao managed, com modelo simples de cobranca por participante/minuto.

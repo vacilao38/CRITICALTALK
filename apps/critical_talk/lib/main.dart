@@ -6,8 +6,11 @@ import 'dart:typed_data';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:path/path.dart' as p;
+
+import 'package:critical_talk/user_foundation.dart';
 
 typedef ChatImagePicker = Future<SelectedChatImage?> Function();
 
@@ -15,15 +18,57 @@ void main() {
   runApp(const CriticalTalkApp());
 }
 
-class CriticalTalkApp extends StatelessWidget {
+class CriticalTalkApp extends StatefulWidget {
   const CriticalTalkApp({
     super.key,
     this.imagePicker = pickChatImage,
     this.audioService = const LinuxAudioControlService(),
+    this.userAuthService = const _DefaultUserAuthServiceBridge(),
   });
 
   final ChatImagePicker imagePicker;
   final AudioControlService audioService;
+  final UserAuthService userAuthService;
+
+  @override
+  State<CriticalTalkApp> createState() => _CriticalTalkAppState();
+}
+
+class _CriticalTalkAppState extends State<CriticalTalkApp> {
+  late Future<AuthSession> _sessionFuture;
+  CriticalUser? _currentUser;
+
+  @override
+  void initState() {
+    super.initState();
+    _sessionFuture = widget.userAuthService.loadSession();
+  }
+
+  void _setAuthenticatedUser(CriticalUser user) {
+    setState(() {
+      _currentUser = user;
+    });
+  }
+
+  Future<void> _logout() async {
+    await widget.userAuthService.logout();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _currentUser = null;
+      _sessionFuture = Future<AuthSession>.value(
+        const AuthSession(currentUser: null),
+      );
+    });
+  }
+
+  void _retryBootstrap() {
+    setState(() {
+      _sessionFuture = widget.userAuthService.loadSession();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -38,7 +83,85 @@ class CriticalTalkApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF151719),
         useMaterial3: true,
       ),
-      home: SessionShell(imagePicker: imagePicker, audioService: audioService),
+      home: FutureBuilder<AuthSession>(
+        future: _sessionFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done &&
+              _currentUser == null) {
+            return const BootstrapShell();
+          }
+
+          if (snapshot.hasError && _currentUser == null) {
+            return BootstrapErrorShell(onRetry: _retryBootstrap);
+          }
+
+          final currentUser = _currentUser ?? snapshot.data?.currentUser;
+
+          if (currentUser == null) {
+            return AuthShell(
+              authService: widget.userAuthService,
+              onAuthenticated: _setAuthenticatedUser,
+            );
+          }
+
+          return SessionShell(
+            imagePicker: widget.imagePicker,
+            audioService: widget.audioService,
+            currentUser: currentUser,
+            authService: widget.userAuthService,
+            onProfileUpdated: _setAuthenticatedUser,
+            onLogout: _logout,
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _DefaultUserAuthServiceBridge extends UserAuthService {
+  const _DefaultUserAuthServiceBridge();
+
+  @override
+  Future<AuthSession> loadSession() => FileUserAuthService().loadSession();
+
+  @override
+  Future<CriticalUser> login({
+    required String userName,
+    required String password,
+  }) {
+    return FileUserAuthService().login(userName: userName, password: password);
+  }
+
+  @override
+  Future<UserRegistrationResult> register({
+    required String userName,
+    required String password,
+    required List<int> organicEntropy,
+  }) {
+    return FileUserAuthService().register(
+      userName: userName,
+      password: password,
+      organicEntropy: organicEntropy,
+    );
+  }
+
+  @override
+  Future<void> logout() => FileUserAuthService().logout();
+
+  @override
+  Future<CriticalUser> updateProfile({
+    required String userId,
+    required String userName,
+    UserMedia? avatar,
+    UserMedia? banner,
+    required double bannerAlignmentY,
+  }) {
+    return FileUserAuthService().updateProfile(
+      userId: userId,
+      userName: userName,
+      avatar: avatar,
+      banner: banner,
+      bannerAlignmentY: bannerAlignmentY,
     );
   }
 }
@@ -58,6 +181,638 @@ Future<SelectedChatImage?> pickChatImage() async {
   final bytes = await file.readAsBytes();
 
   return SelectedChatImage(name: file.name, bytes: bytes);
+}
+
+class BootstrapShell extends StatelessWidget {
+  const BootstrapShell({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const Scaffold(
+      body: Center(
+        child: SizedBox(
+          width: 240,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('Carregando sessao segura'),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class BootstrapErrorShell extends StatelessWidget {
+  const BootstrapErrorShell({required this.onRetry, super.key});
+
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360),
+          child: Panel(
+            title: 'Falha ao abrir sessao',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'Nao foi possivel abrir os dados locais do usuario. Voce pode tentar novamente.',
+                ),
+                const Spacer(),
+                FilledButton(
+                  onPressed: onRetry,
+                  child: const Text('Tentar de novo'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AuthShell extends StatefulWidget {
+  const AuthShell({
+    required this.authService,
+    required this.onAuthenticated,
+    super.key,
+  });
+
+  final UserAuthService authService;
+  final ValueChanged<CriticalUser> onAuthenticated;
+
+  @override
+  State<AuthShell> createState() => _AuthShellState();
+}
+
+class _AuthShellState extends State<AuthShell>
+    with SingleTickerProviderStateMixin {
+  late final TabController _tabController;
+  final _loginUserNameController = TextEditingController();
+  final _loginPasswordController = TextEditingController();
+  final _registerUserNameController = TextEditingController();
+  final _registerPasswordController = TextEditingController();
+  final _registerConfirmController = TextEditingController();
+  final List<int> _entropyDeltas = [];
+  int? _lastEntropyStamp;
+  bool _isBusy = false;
+  String? _loginError;
+  String? _registerError;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 2, vsync: this);
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    _loginUserNameController.dispose();
+    _loginPasswordController.dispose();
+    _registerUserNameController.dispose();
+    _registerPasswordController.dispose();
+    _registerConfirmController.dispose();
+    super.dispose();
+  }
+
+  void _recordOrganicEntropy(String _) {
+    final now = DateTime.now().microsecondsSinceEpoch;
+    final lastStamp = _lastEntropyStamp;
+
+    if (lastStamp != null) {
+      final delta = now - lastStamp;
+      if (delta > 0) {
+        _entropyDeltas.add(delta);
+        if (_entropyDeltas.length > 64) {
+          _entropyDeltas.removeAt(0);
+        }
+      }
+    }
+
+    _lastEntropyStamp = now;
+  }
+
+  Future<void> _login() async {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _isBusy = true;
+      _loginError = null;
+    });
+
+    try {
+      final user = await widget.authService.login(
+        userName: _loginUserNameController.text,
+        password: _loginPasswordController.text,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      widget.onAuthenticated(user);
+    } on UserAuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _loginError = error.message;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _register() async {
+    FocusScope.of(context).unfocus();
+    final confirmPassword = _registerConfirmController.text;
+
+    if (_registerPasswordController.text != confirmPassword) {
+      setState(() {
+        _registerError = 'A confirmacao de senha nao confere.';
+      });
+      return;
+    }
+
+    setState(() {
+      _isBusy = true;
+      _registerError = null;
+    });
+
+    try {
+      final result = await widget.authService.register(
+        userName: _registerUserNameController.text,
+        password: _registerPasswordController.text,
+        organicEntropy: List<int>.from(_entropyDeltas),
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      await showDialog<void>(
+        context: context,
+        builder: (context) {
+          return AlertDialog(
+            title: const Text('Chave inicial do usuario'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Guarde essa chave. Ela representa o identificador fixo gerado na criacao da conta e esta sendo exibida agora para o primeiro pareamento.',
+                ),
+                const SizedBox(height: 12),
+                SelectableText(
+                  result.firstTimeKey,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w800,
+                    color: Color(0xFFBFE9DD),
+                  ),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () async {
+                  await Clipboard.setData(
+                    ClipboardData(text: result.firstTimeKey),
+                  );
+                  if (context.mounted) {
+                    Navigator.of(context).pop();
+                  }
+                },
+                child: const Text('Copiar'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  Navigator.of(context).pop();
+                },
+                child: const Text('Continuar'),
+              ),
+            ],
+          );
+        },
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      widget.onAuthenticated(result.user);
+    } on UserAuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _registerError = error.message;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final passwordErrors = validatePassword(_registerPasswordController.text);
+    final userNameErrors = validateUserName(_registerUserNameController.text);
+
+    return Scaffold(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Row(
+            children: [
+              Expanded(
+                child: Container(
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF202326),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: const Color(0xFF30363A)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Container(
+                            width: 44,
+                            height: 44,
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF2F7D6D),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Icon(
+                              Icons.casino,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          const Text(
+                            'Critical Talk',
+                            style: TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 24),
+                      const Text(
+                        'Base de usuario e perfil',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Sem email, com nome de usuario, senha forte e identificador fixo protegido localmente.',
+                        style: TextStyle(color: Color(0xFFAEB8B5), height: 1.5),
+                      ),
+                      const SizedBox(height: 20),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: const [
+                          HeaderPill(icon: Icons.badge, label: 'ID fixo'),
+                          HeaderPill(
+                            icon: Icons.lock,
+                            label: 'Hash + entropia',
+                          ),
+                          HeaderPill(
+                            icon: Icons.perm_identity,
+                            label: 'Perfil local',
+                          ),
+                        ],
+                      ),
+                      const Spacer(),
+                      const AuthInfoStrip(
+                        title: 'Fechando brechas agora',
+                        lines: [
+                          'O nome de usuario vira identidade primaria de login.',
+                          'A senha fica derivada com Argon2id, nunca em texto puro.',
+                          'O ID mistura aleatoriedade forte com cadencia humana complementar.',
+                          'Os dados locais do usuario ficam gravados em blob criptografado.',
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 20),
+              SizedBox(
+                width: 420,
+                child: Panel(
+                  title: 'Acesso',
+                  child: Column(
+                    children: [
+                      TabBar(
+                        controller: _tabController,
+                        tabs: const [
+                          Tab(text: 'Entrar'),
+                          Tab(text: 'Criar usuario'),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      Expanded(
+                        child: TabBarView(
+                          controller: _tabController,
+                          children: [
+                            SingleChildScrollView(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  LabeledTextField(
+                                    controller: _loginUserNameController,
+                                    label: 'Nome de usuario',
+                                    hintText: 'rogerin',
+                                  ),
+                                  const SizedBox(height: 12),
+                                  LabeledTextField(
+                                    controller: _loginPasswordController,
+                                    label: 'Senha',
+                                    hintText: 'Sua senha segura',
+                                    obscureText: true,
+                                    onSubmitted: (_) => _login(),
+                                  ),
+                                  if (_loginError != null) ...[
+                                    const SizedBox(height: 12),
+                                    ErrorStrip(message: _loginError!),
+                                  ],
+                                  const SizedBox(height: 16),
+                                  FilledButton(
+                                    onPressed: _isBusy ? null : _login,
+                                    child: Text(
+                                      _isBusy ? 'Entrando...' : 'Entrar',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            SingleChildScrollView(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.stretch,
+                                children: [
+                                  LabeledTextField(
+                                    controller: _registerUserNameController,
+                                    label: 'Nome de usuario',
+                                    hintText: 'rogerin',
+                                    onChanged: _recordOrganicEntropy,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  LabeledTextField(
+                                    controller: _registerPasswordController,
+                                    label: 'Senha',
+                                    hintText: 'Minimo de 8 caracteres',
+                                    obscureText: true,
+                                    onChanged: _recordOrganicEntropy,
+                                  ),
+                                  const SizedBox(height: 12),
+                                  LabeledTextField(
+                                    controller: _registerConfirmController,
+                                    label: 'Confirmar senha',
+                                    hintText: 'Repita a senha',
+                                    obscureText: true,
+                                    onChanged: _recordOrganicEntropy,
+                                    onSubmitted: (_) => _register(),
+                                  ),
+                                  const SizedBox(height: 16),
+                                  PasswordRuleList(
+                                    userNameErrors: userNameErrors,
+                                    passwordErrors: passwordErrors,
+                                    passwordsMatch:
+                                        _registerPasswordController.text ==
+                                            _registerConfirmController.text &&
+                                        _registerConfirmController
+                                            .text
+                                            .isNotEmpty,
+                                  ),
+                                  if (_registerError != null) ...[
+                                    const SizedBox(height: 12),
+                                    ErrorStrip(message: _registerError!),
+                                  ],
+                                  const SizedBox(height: 16),
+                                  FilledButton(
+                                    onPressed: _isBusy ? null : _register,
+                                    child: Text(
+                                      _isBusy
+                                          ? 'Criando usuario...'
+                                          : 'Criar usuario',
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class AuthInfoStrip extends StatelessWidget {
+  const AuthInfoStrip({required this.title, required this.lines, super.key});
+
+  final String title;
+  final List<String> lines;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1D20),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: const Color(0xFF2A2F33)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          ...lines.map(
+            (line) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Padding(
+                    padding: EdgeInsets.only(top: 2),
+                    child: Icon(
+                      Icons.check_circle_outline,
+                      size: 16,
+                      color: Color(0xFF80DFC8),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      line,
+                      style: const TextStyle(
+                        color: Color(0xFFAEB8B5),
+                        height: 1.4,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class LabeledTextField extends StatelessWidget {
+  const LabeledTextField({
+    required this.controller,
+    required this.label,
+    required this.hintText,
+    this.obscureText = false,
+    this.onChanged,
+    this.onSubmitted,
+    super.key,
+  });
+
+  final TextEditingController controller;
+  final String label;
+  final String hintText;
+  final bool obscureText;
+  final ValueChanged<String>? onChanged;
+  final ValueChanged<String>? onSubmitted;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 8),
+        TextField(
+          controller: controller,
+          obscureText: obscureText,
+          onChanged: onChanged,
+          onSubmitted: onSubmitted,
+          decoration: InputDecoration(
+            hintText: hintText,
+            filled: true,
+            fillColor: const Color(0xFF151719),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: BorderSide.none,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class PasswordRuleList extends StatelessWidget {
+  const PasswordRuleList({
+    required this.userNameErrors,
+    required this.passwordErrors,
+    required this.passwordsMatch,
+    super.key,
+  });
+
+  final List<String> userNameErrors;
+  final List<String> passwordErrors;
+  final bool passwordsMatch;
+
+  @override
+  Widget build(BuildContext context) {
+    final items = [
+      RuleItem(
+        text: 'Nome de usuario entre 3 e 24 caracteres',
+        satisfied:
+            !userNameErrors.any((error) => error.contains('3 caracteres')) &&
+            !userNameErrors.any((error) => error.contains('24 caracteres')),
+      ),
+      RuleItem(
+        text: 'Nome com letras, numeros, ponto, traco ou sublinhado',
+        satisfied: !userNameErrors.any(
+          (error) => error.contains('Use apenas letras'),
+        ),
+      ),
+      RuleItem(
+        text:
+            'Senha com 8+ caracteres, maiuscula, minuscula, numero e especial',
+        satisfied: passwordErrors.isEmpty,
+      ),
+      RuleItem(text: 'Confirmacao de senha igual', satisfied: passwordsMatch),
+    ];
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: items
+          .map(
+            (item) => Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Row(
+                children: [
+                  Icon(
+                    item.satisfied
+                        ? Icons.check_circle
+                        : Icons.radio_button_unchecked,
+                    size: 16,
+                    color: item.satisfied
+                        ? const Color(0xFF80DFC8)
+                        : const Color(0xFF6E7875),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      item.text,
+                      style: const TextStyle(
+                        color: Color(0xFFAEB8B5),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          )
+          .toList(),
+    );
+  }
+}
+
+class RuleItem {
+  const RuleItem({required this.text, required this.satisfied});
+
+  final String text;
+  final bool satisfied;
 }
 
 abstract class AudioControlService {
@@ -454,11 +1209,19 @@ class SessionShell extends StatefulWidget {
   const SessionShell({
     required this.imagePicker,
     required this.audioService,
+    required this.currentUser,
+    required this.authService,
+    required this.onProfileUpdated,
+    required this.onLogout,
     super.key,
   });
 
   final ChatImagePicker imagePicker;
   final AudioControlService audioService;
+  final CriticalUser currentUser;
+  final UserAuthService authService;
+  final ValueChanged<CriticalUser> onProfileUpdated;
+  final Future<void> Function() onLogout;
 
   @override
   State<SessionShell> createState() => _SessionShellState();
@@ -696,7 +1459,9 @@ class _SessionShellState extends State<SessionShell> {
     }
 
     setState(() {
-      _messages.add(ChatMessage.text('Rogerin', cleanText, self: true));
+      _messages.add(
+        ChatMessage.text(widget.currentUser.userName, cleanText, self: true),
+      );
     });
 
     _queueBotReply();
@@ -721,7 +1486,7 @@ class _SessionShellState extends State<SessionShell> {
       setState(() {
         _messages.add(
           ChatMessage.image(
-            'Rogerin',
+            widget.currentUser.userName,
             imageName: image.name,
             imageBytes: image.bytes,
             self: true,
@@ -739,6 +1504,46 @@ class _SessionShellState extends State<SessionShell> {
     }
   }
 
+  Future<void> _openProfileEditor() async {
+    final draft = await showDialog<ProfileEditorDraft>(
+      context: context,
+      builder: (context) {
+        return ProfileEditorDialog(
+          user: widget.currentUser,
+          imagePicker: widget.imagePicker,
+        );
+      },
+    );
+
+    if (draft == null) {
+      return;
+    }
+
+    try {
+      final updatedUser = await widget.authService.updateProfile(
+        userId: widget.currentUser.userId,
+        userName: draft.userName,
+        avatar: draft.avatar,
+        banner: draft.banner,
+        bannerAlignmentY: draft.bannerAlignmentY,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      widget.onProfileUpdated(updatedUser);
+    } on UserAuthException catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -749,7 +1554,11 @@ class _SessionShellState extends State<SessionShell> {
             Expanded(
               child: Column(
                 children: [
-                  const SessionHeader(),
+                  SessionHeader(
+                    currentUser: widget.currentUser,
+                    onEditProfile: _openProfileEditor,
+                    onLogout: widget.onLogout,
+                  ),
                   Expanded(
                     child: Padding(
                       padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
@@ -775,6 +1584,8 @@ class _SessionShellState extends State<SessionShell> {
                               onInputSelected: _selectInput,
                               onOutputSelected: _selectOutput,
                               onToggleMute: _toggleMute,
+                              currentUser: widget.currentUser,
+                              onEditProfile: _openProfileEditor,
                             );
                           }
 
@@ -795,6 +1606,8 @@ class _SessionShellState extends State<SessionShell> {
                             onInputSelected: _selectInput,
                             onOutputSelected: _selectOutput,
                             onToggleMute: _toggleMute,
+                            currentUser: widget.currentUser,
+                            onEditProfile: _openProfileEditor,
                           );
                         },
                       ),
@@ -828,6 +1641,8 @@ class WideSessionLayout extends StatelessWidget {
     required this.onInputSelected,
     required this.onOutputSelected,
     required this.onToggleMute,
+    required this.currentUser,
+    required this.onEditProfile,
     super.key,
   });
 
@@ -847,6 +1662,8 @@ class WideSessionLayout extends StatelessWidget {
   final ValueChanged<String> onInputSelected;
   final ValueChanged<String> onOutputSelected;
   final VoidCallback onToggleMute;
+  final CriticalUser currentUser;
+  final Future<void> Function() onEditProfile;
 
   @override
   Widget build(BuildContext context) {
@@ -862,6 +1679,7 @@ class WideSessionLayout extends StatelessWidget {
             isMicMuted: isMicMuted,
             isSelfMonitoring: isSelfMonitoring,
             selfInputLevel: selfInputLevel,
+            currentUser: currentUser,
             onRefreshAudio: onRefreshAudio,
             onPlayBotAudio: onPlayBotAudio,
             onToggleSelfMonitoring: onToggleSelfMonitoring,
@@ -880,7 +1698,13 @@ class WideSessionLayout extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 12),
-        const SizedBox(width: 340, child: SideToolsPanel()),
+        SizedBox(
+          width: 340,
+          child: SideToolsPanel(
+            currentUser: currentUser,
+            onEditProfile: onEditProfile,
+          ),
+        ),
       ],
     );
   }
@@ -904,6 +1728,8 @@ class CompactSessionLayout extends StatelessWidget {
     required this.onInputSelected,
     required this.onOutputSelected,
     required this.onToggleMute,
+    required this.currentUser,
+    required this.onEditProfile,
     super.key,
   });
 
@@ -923,6 +1749,8 @@ class CompactSessionLayout extends StatelessWidget {
   final ValueChanged<String> onInputSelected;
   final ValueChanged<String> onOutputSelected;
   final VoidCallback onToggleMute;
+  final CriticalUser currentUser;
+  final Future<void> Function() onEditProfile;
 
   @override
   Widget build(BuildContext context) {
@@ -937,6 +1765,7 @@ class CompactSessionLayout extends StatelessWidget {
             isMicMuted: isMicMuted,
             isSelfMonitoring: isSelfMonitoring,
             selfInputLevel: selfInputLevel,
+            currentUser: currentUser,
             onRefreshAudio: onRefreshAudio,
             onPlayBotAudio: onPlayBotAudio,
             onToggleSelfMonitoring: onToggleSelfMonitoring,
@@ -958,7 +1787,13 @@ class CompactSessionLayout extends StatelessWidget {
                 ),
               ),
               const SizedBox(width: 12),
-              const SizedBox(width: 320, child: SideToolsPanel()),
+              SizedBox(
+                width: 320,
+                child: SideToolsPanel(
+                  currentUser: currentUser,
+                  onEditProfile: onEditProfile,
+                ),
+              ),
             ],
           ),
         ),
@@ -1042,7 +1877,16 @@ class RailButton extends StatelessWidget {
 }
 
 class SessionHeader extends StatelessWidget {
-  const SessionHeader({super.key});
+  const SessionHeader({
+    required this.currentUser,
+    required this.onEditProfile,
+    required this.onLogout,
+    super.key,
+  });
+
+  final CriticalUser currentUser;
+  final Future<void> Function() onEditProfile;
+  final Future<void> Function() onLogout;
 
   @override
   Widget build(BuildContext context) {
@@ -1077,9 +1921,56 @@ class SessionHeader extends StatelessWidget {
           const SizedBox(width: 8),
           const HeaderPill(icon: Icons.people, label: '5 online'),
           const SizedBox(width: 8),
-          IconToolButton(icon: Icons.copy, label: 'Copiar convite'),
+          const IconToolButton(icon: Icons.copy, label: 'Copiar convite'),
           const SizedBox(width: 8),
-          IconToolButton(icon: Icons.more_horiz, label: 'Mais opcoes'),
+          InkWell(
+            borderRadius: BorderRadius.circular(8),
+            onTap: onEditProfile,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              child: Row(
+                children: [
+                  AvatarBadge(
+                    initials: currentUser.initials,
+                    color: const Color(0xFF55BCA4),
+                    size: 34,
+                    imageBytes: currentUser.profile.avatar?.bytes,
+                  ),
+                  const SizedBox(width: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 148),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          currentUser.userName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                        Text(
+                          currentUser.maskedId,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFFAEB8B5),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconToolButton(
+            icon: Icons.logout,
+            label: 'Sair',
+            onPressed: onLogout,
+          ),
         ],
       ),
     );
@@ -1121,6 +2012,7 @@ class VoicePanel extends StatelessWidget {
     required this.isMicMuted,
     required this.isSelfMonitoring,
     required this.selfInputLevel,
+    required this.currentUser,
     required this.onRefreshAudio,
     required this.onPlayBotAudio,
     required this.onToggleSelfMonitoring,
@@ -1136,6 +2028,7 @@ class VoicePanel extends StatelessWidget {
   final bool isMicMuted;
   final bool isSelfMonitoring;
   final double selfInputLevel;
+  final CriticalUser currentUser;
   final Future<void> Function() onRefreshAudio;
   final Future<void> Function() onPlayBotAudio;
   final Future<void> Function() onToggleSelfMonitoring;
@@ -1168,8 +2061,8 @@ class VoicePanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final participants = [
       ParticipantView(
-        name: 'Rogerin',
-        initials: 'RO',
+        name: currentUser.userName,
+        initials: currentUser.initials,
         status: isMicMuted
             ? 'Silenciado'
             : isSelfMonitoring
@@ -1181,6 +2074,7 @@ class VoicePanel extends StatelessWidget {
         speaking: !isMicMuted && selfInputLevel > 0.08,
         level: isMicMuted ? 0 : selfInputLevel,
         isSelf: true,
+        imageBytes: currentUser.profile.avatar?.bytes,
       ),
       ..._partyMembers,
       ParticipantView(
@@ -1430,6 +2324,7 @@ class ParticipantTile extends StatelessWidget {
             initials: participant.initials,
             color: participant.color,
             size: 42,
+            imageBytes: participant.imageBytes,
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -2047,17 +2942,30 @@ class _MessageComposerBodyState extends State<_MessageComposerBody> {
 }
 
 class SideToolsPanel extends StatelessWidget {
-  const SideToolsPanel({super.key});
+  const SideToolsPanel({
+    required this.currentUser,
+    required this.onEditProfile,
+    super.key,
+  });
+
+  final CriticalUser currentUser;
+  final Future<void> Function() onEditProfile;
 
   @override
   Widget build(BuildContext context) {
     return Column(
-      children: const [
-        Expanded(flex: 3, child: MusicPanel()),
-        SizedBox(height: 12),
-        Expanded(flex: 2, child: DicePanel()),
-        SizedBox(height: 12),
-        SizedBox(height: 132, child: ProfilePanel()),
+      children: [
+        const Expanded(flex: 3, child: MusicPanel()),
+        const SizedBox(height: 12),
+        const Expanded(flex: 2, child: DicePanel()),
+        const SizedBox(height: 12),
+        SizedBox(
+          height: 164,
+          child: ProfilePanel(
+            currentUser: currentUser,
+            onEditProfile: onEditProfile,
+          ),
+        ),
       ],
     );
   }
@@ -2243,39 +3151,404 @@ class DiceChip extends StatelessWidget {
 }
 
 class ProfilePanel extends StatelessWidget {
-  const ProfilePanel({super.key});
+  const ProfilePanel({
+    required this.currentUser,
+    required this.onEditProfile,
+    super.key,
+  });
+
+  final CriticalUser currentUser;
+  final Future<void> Function() onEditProfile;
 
   @override
   Widget build(BuildContext context) {
     return Panel(
       title: 'Perfil',
-      trailing: IconToolButton(icon: Icons.edit, label: 'Editar perfil'),
-      child: Row(
+      trailing: IconToolButton(
+        icon: Icons.edit,
+        label: 'Editar perfil',
+        onPressed: onEditProfile,
+      ),
+      child: Column(
         children: [
-          const AvatarBadge(initials: 'RO', color: Color(0xFF55BCA4), size: 58),
-          const SizedBox(width: 12),
           Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
-                Text(
-                  'Rogerin',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontWeight: FontWeight.w800),
-                ),
-                SizedBox(height: 4),
-                Text(
-                  'Banner: Vale Cinzento',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(color: Color(0xFFAEB8B5), fontSize: 12),
-                ),
-              ],
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(8),
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  if (currentUser.profile.banner?.bytes != null)
+                    Image.memory(
+                      currentUser.profile.banner!.bytes,
+                      fit: BoxFit.cover,
+                      alignment: Alignment(
+                        0,
+                        currentUser.profile.bannerAlignmentY,
+                      ),
+                      errorBuilder: (_, _, _) => _profileBannerFallback(),
+                    )
+                  else
+                    _profileBannerFallback(),
+                  Container(
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [Colors.transparent, Color(0xCC151719)],
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    left: 10,
+                    right: 10,
+                    bottom: 10,
+                    child: Row(
+                      children: [
+                        AvatarBadge(
+                          initials: currentUser.initials,
+                          color: const Color(0xFF55BCA4),
+                          size: 54,
+                          imageBytes: currentUser.profile.avatar?.bytes,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                currentUser.userName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                  fontSize: 15,
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                currentUser.maskedId,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Color(0xFFAEB8B5),
+                                  fontSize: 12,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
+          const SizedBox(height: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              CounterBadge(
+                text:
+                    'perfis futuros: ${currentUser.profile.profileIds.length}',
+              ),
+              const SizedBox(height: 6),
+              Text(
+                currentUser.profile.banner?.fileName ?? 'banner padrao',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Color(0xFFAEB8B5), fontSize: 12),
+              ),
+            ],
+          ),
         ],
+      ),
+    );
+  }
+
+  Widget _profileBannerFallback() {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Color(0xFF243B36), Color(0xFF1B2023), Color(0xFF3E3134)],
+        ),
+      ),
+    );
+  }
+}
+
+class ProfileEditorDraft {
+  const ProfileEditorDraft({
+    required this.userName,
+    required this.avatar,
+    required this.banner,
+    required this.bannerAlignmentY,
+  });
+
+  final String userName;
+  final UserMedia? avatar;
+  final UserMedia? banner;
+  final double bannerAlignmentY;
+}
+
+class ProfileEditorDialog extends StatefulWidget {
+  const ProfileEditorDialog({
+    required this.user,
+    required this.imagePicker,
+    super.key,
+  });
+
+  final CriticalUser user;
+  final ChatImagePicker imagePicker;
+
+  @override
+  State<ProfileEditorDialog> createState() => _ProfileEditorDialogState();
+}
+
+class _ProfileEditorDialogState extends State<ProfileEditorDialog> {
+  late final TextEditingController _userNameController;
+  late UserMedia? _avatar;
+  late UserMedia? _banner;
+  late double _bannerAlignmentY;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _userNameController = TextEditingController(text: widget.user.userName);
+    _avatar = widget.user.profile.avatar;
+    _banner = widget.user.profile.banner;
+    _bannerAlignmentY = widget.user.profile.bannerAlignmentY;
+  }
+
+  @override
+  void dispose() {
+    _userNameController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickAvatar() async {
+    setState(() {
+      _busy = true;
+    });
+
+    try {
+      final selected = await widget.imagePicker();
+      if (!mounted || selected == null) {
+        return;
+      }
+
+      setState(() {
+        _avatar = UserMedia(fileName: selected.name, bytes: selected.bytes);
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _pickBanner() async {
+    setState(() {
+      _busy = true;
+    });
+
+    try {
+      final selected = await widget.imagePicker();
+      if (!mounted || selected == null) {
+        return;
+      }
+
+      setState(() {
+        _banner = UserMedia(fileName: selected.name, bytes: selected.bytes);
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Editar perfil'),
+      content: SizedBox(
+        width: 520,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              LabeledTextField(
+                controller: _userNameController,
+                label: 'Nome de usuario',
+                hintText: 'rogerin',
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'ID fixo mascarado',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              CounterBadge(text: widget.user.maskedId),
+              const SizedBox(height: 16),
+              const Text(
+                'Avatar',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  AvatarBadge(
+                    initials: _userNameController.text.trim().isEmpty
+                        ? widget.user.initials
+                        : _userNameController.text
+                              .trim()
+                              .substring(
+                                0,
+                                math.min(
+                                  2,
+                                  _userNameController.text.trim().length,
+                                ),
+                              )
+                              .toUpperCase(),
+                    color: const Color(0xFF55BCA4),
+                    size: 58,
+                    imageBytes: _avatar?.bytes,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _avatar?.fileName ?? 'Nenhum avatar selecionado',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconToolButton(
+                    icon: Icons.image,
+                    label: 'Trocar avatar',
+                    onPressed: _busy ? null : _pickAvatar,
+                  ),
+                  const SizedBox(width: 8),
+                  IconToolButton(
+                    icon: Icons.delete_outline,
+                    label: 'Remover avatar',
+                    onPressed: _avatar == null
+                        ? null
+                        : () {
+                            setState(() {
+                              _avatar = null;
+                            });
+                          },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Banner/GIF',
+                style: TextStyle(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: SizedBox(
+                  height: 120,
+                  width: double.infinity,
+                  child: _banner?.bytes != null
+                      ? Image.memory(
+                          _banner!.bytes,
+                          fit: BoxFit.cover,
+                          alignment: Alignment(0, _bannerAlignmentY),
+                          errorBuilder: (_, _, _) => _profileBannerFallback(),
+                        )
+                      : _profileBannerFallback(),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _banner?.fileName ?? 'Nenhum banner selecionado',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  IconToolButton(
+                    icon: Icons.image_search,
+                    label: 'Trocar banner',
+                    onPressed: _busy ? null : _pickBanner,
+                  ),
+                  const SizedBox(width: 8),
+                  IconToolButton(
+                    icon: Icons.delete_outline,
+                    label: 'Remover banner',
+                    onPressed: _banner == null
+                        ? null
+                        : () {
+                            setState(() {
+                              _banner = null;
+                            });
+                          },
+                  ),
+                  const SizedBox(width: 12),
+                  const Text(
+                    'Crop vertical',
+                    style: TextStyle(color: Color(0xFFAEB8B5), fontSize: 12),
+                  ),
+                ],
+              ),
+              Slider(
+                value: _bannerAlignmentY,
+                min: -1,
+                max: 1,
+                divisions: 20,
+                onChanged: (value) {
+                  setState(() {
+                    _bannerAlignmentY = value;
+                  });
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            Navigator.of(context).pop();
+          },
+          child: const Text('Cancelar'),
+        ),
+        FilledButton(
+          onPressed: () {
+            Navigator.of(context).pop(
+              ProfileEditorDraft(
+                userName: _userNameController.text,
+                avatar: _avatar,
+                banner: _banner,
+                bannerAlignmentY: _bannerAlignmentY,
+              ),
+            );
+          },
+          child: const Text('Salvar'),
+        ),
+      ],
+    );
+  }
+
+  Widget _profileBannerFallback() {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Color(0xFF243B36), Color(0xFF1B2023), Color(0xFF3E3134)],
+        ),
       ),
     );
   }
@@ -2405,12 +3678,14 @@ class AvatarBadge extends StatelessWidget {
     required this.initials,
     required this.color,
     required this.size,
+    this.imageBytes,
     super.key,
   });
 
   final String initials;
   final Color color;
   final double size;
+  final Uint8List? imageBytes;
 
   @override
   Widget build(BuildContext context) {
@@ -2422,13 +3697,30 @@ class AvatarBadge extends StatelessWidget {
         color: color,
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Text(
-        initials,
-        style: const TextStyle(
-          color: Colors.white,
-          fontWeight: FontWeight.w900,
-        ),
-      ),
+      clipBehavior: Clip.antiAlias,
+      child: imageBytes != null
+          ? Image.memory(
+              imageBytes!,
+              fit: BoxFit.cover,
+              errorBuilder: (_, _, _) {
+                return _AvatarInitials(initials: initials);
+              },
+            )
+          : _AvatarInitials(initials: initials),
+    );
+  }
+}
+
+class _AvatarInitials extends StatelessWidget {
+  const _AvatarInitials({required this.initials});
+
+  final String initials;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      initials,
+      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900),
     );
   }
 }
@@ -2442,6 +3734,7 @@ class ParticipantView {
     this.speaking = false,
     this.level = 0,
     this.isSelf = false,
+    this.imageBytes,
   });
 
   final String name;
@@ -2451,6 +3744,7 @@ class ParticipantView {
   final bool speaking;
   final double level;
   final bool isSelf;
+  final Uint8List? imageBytes;
 }
 
 class AudioDevice {

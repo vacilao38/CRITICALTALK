@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -5,6 +6,7 @@ import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:critical_talk/main.dart';
+import 'package:critical_talk/user_foundation.dart';
 
 void main() {
   test('sanitizes obsidian links while preserving visible labels', () {
@@ -31,6 +33,61 @@ void main() {
     expect(find.text('Perfil'), findsOneWidget);
   });
 
+  testWidgets('shows the auth shell when there is no active user', (
+    WidgetTester tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _buildApp(authService: FakeUserAuthService(startAuthenticated: false)),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Acesso'), findsOneWidget);
+    expect(find.text('Criar usuario'), findsWidgets);
+  });
+
+  testWidgets('creates a local user and enters the session', (
+    WidgetTester tester,
+  ) async {
+    final authService = FakeUserAuthService(startAuthenticated: false);
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(_buildApp(authService: authService));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Criar usuario').last);
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.widgetWithText(TextField, 'rogerin'),
+      'rog_test',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Minimo de 8 caracteres'),
+      'Senha@123',
+    );
+    await tester.enterText(
+      find.widgetWithText(TextField, 'Repita a senha'),
+      'Senha@123',
+    );
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Criar usuario'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Chave inicial do usuario'), findsOneWidget);
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Continuar'));
+    await tester.pumpAndSettle();
+
+    expect(authService.registerCount, 1);
+    expect(find.text('Critical Talk'), findsOneWidget);
+    expect(find.text('rog_test'), findsWidgets);
+  });
+
   testWidgets('keeps the compact layout usable', (WidgetTester tester) async {
     await tester.binding.setSurfaceSize(const Size(1100, 820));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -51,7 +108,7 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
     await tester.pumpWidget(_buildApp(audioService: audioService));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(find.textContaining('usb headset'), findsOneWidget);
 
@@ -72,7 +129,7 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
     await tester.pumpWidget(_buildApp(audioService: audioService));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     await tester.tap(find.widgetWithText(FilledButton, 'Bot'));
     await tester.pump();
@@ -95,7 +152,7 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
     await tester.pumpWidget(_buildApp(audioService: audioService));
-    await tester.pump();
+    await tester.pumpAndSettle();
 
     expect(find.byIcon(Icons.hearing), findsOneWidget);
     expect(find.text('Retorno local ativo'), findsNothing);
@@ -221,10 +278,12 @@ void main() {
 Widget _buildApp({
   ChatImagePicker imagePicker = _defaultImagePicker,
   AudioControlService? audioService,
+  UserAuthService? authService,
 }) {
   return CriticalTalkApp(
     imagePicker: imagePicker,
     audioService: audioService ?? FakeAudioControlService(),
+    userAuthService: authService ?? FakeUserAuthService(),
   );
 }
 
@@ -319,6 +378,101 @@ class FakeAudioControlService extends AudioControlService {
   Future<void> stopInputMonitoring() async {
     _stopMonitoringCount++;
     _isMonitoring = false;
+  }
+}
+
+class FakeUserAuthService extends UserAuthService {
+  FakeUserAuthService({this.startAuthenticated = true}) {
+    if (startAuthenticated) {
+      _users[_seedUser.userName.toLowerCase()] = _seedUser;
+      _passwords[_seedUser.userName.toLowerCase()] = 'Senha@123';
+      _currentUser = _seedUser;
+    }
+  }
+
+  final bool startAuthenticated;
+  final Map<String, CriticalUser> _users = {};
+  final Map<String, String> _passwords = {};
+  CriticalUser? _currentUser;
+  int registerCount = 0;
+
+  static final _seedUser = CriticalUser(
+    userId: 'ctu-seed-0001',
+    userName: 'Rogerin',
+    createdAt: DateTime(2026, 1, 1),
+    profile: const UserProfile(profileIds: [], bannerAlignmentY: 0),
+  );
+
+  @override
+  Future<AuthSession> loadSession() async {
+    return AuthSession(currentUser: _currentUser);
+  }
+
+  @override
+  Future<CriticalUser> login({
+    required String userName,
+    required String password,
+  }) async {
+    final normalized = userName.trim().toLowerCase();
+    final user = _users[normalized];
+    if (user == null || _passwords[normalized] != password) {
+      throw const UserAuthException('Usuario ou senha invalidos.');
+    }
+
+    _currentUser = user;
+    return user;
+  }
+
+  @override
+  Future<UserRegistrationResult> register({
+    required String userName,
+    required String password,
+    required List<int> organicEntropy,
+  }) async {
+    registerCount++;
+    final normalized = userName.trim().toLowerCase();
+    final user = CriticalUser(
+      userId: 'ctu-test-${registerCount.toString().padLeft(4, '0')}',
+      userName: userName.trim(),
+      createdAt: DateTime(2026, 6, 4),
+      profile: const UserProfile(profileIds: [], bannerAlignmentY: 0),
+    );
+    _users[normalized] = user;
+    _passwords[normalized] = password;
+    _currentUser = user;
+    return UserRegistrationResult(user: user, firstTimeKey: user.userId);
+  }
+
+  @override
+  Future<void> logout() async {
+    _currentUser = null;
+  }
+
+  @override
+  Future<CriticalUser> updateProfile({
+    required String userId,
+    required String userName,
+    UserMedia? avatar,
+    UserMedia? banner,
+    required double bannerAlignmentY,
+  }) async {
+    final current = _currentUser!;
+    final updated = current.copyWith(
+      userName: userName.trim(),
+      profile: current.profile.copyWith(
+        avatar: avatar,
+        clearAvatar: avatar == null,
+        banner: banner,
+        clearBanner: banner == null,
+        bannerAlignmentY: bannerAlignmentY,
+      ),
+    );
+    _users.remove(current.userName.toLowerCase());
+    _users[updated.userName.toLowerCase()] = updated;
+    _passwords[updated.userName.toLowerCase()] =
+        _passwords.remove(current.userName.toLowerCase()) ?? 'Senha@123';
+    _currentUser = updated;
+    return updated;
   }
 }
 

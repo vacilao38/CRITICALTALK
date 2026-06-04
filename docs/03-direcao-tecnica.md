@@ -118,7 +118,7 @@ Decisao fechada:
 
 - autenticacao propria do backend;
 - contas persistentes por usuario;
-- login por email e senha;
+- login por `user_name` e senha;
 - tokens `access` e `refresh`;
 - salas privadas com codigo de convite;
 - membros precisam estar associados a sala para entrar;
@@ -139,7 +139,27 @@ Justificativa:
 - O projeto ja precisa de identidade persistente para perfis, historico, imagens, multiplos personagens e papeis futuros.
 - Convite por sala mantem o produto privado e leve para grupo pequeno.
 - Separar token do app de token do SFU evita expor permissao de voz fora do controle do backend.
-- Email e senha sao mais simples de implementar e operar do que OAuth neste momento.
+- `user_name` e senha forte removem dependencia de email no onboarding inicial e combinam melhor com a proposta de grupos pequenos por convite.
+
+### Modelo de usuario e seguranca
+
+Direcao fechada:
+
+- sem email no cadastro;
+- `user_name` como identidade primaria de autenticacao;
+- senha forte com minimo de 8 caracteres, maiuscula, minuscula, numero e caractere especial;
+- ID fixo opaco gerado a partir de aleatoriedade forte com complemento de entropia organica do momento de criacao;
+- senha armazenada apenas como derivacao Argon2id com `salt`;
+- blob local de usuarios gravado de forma criptografada;
+- chave inicial do ID exibida no primeiro cadastro para pareamento/manual match.
+
+Fechando brechas importantes:
+
+- a entropia organica humana nao pode ser a base unica do ID; ela entra apenas como insumo complementar.
+- a fonte primaria do ID deve continuar sendo aleatoriedade criptograficamente forte.
+- senha nao deve ser "criptografada para recuperar depois"; ela deve ser derivada por hash resistente.
+- o ID pode ser mostrado ao usuario na criacao, mas precisa permanecer persistido localmente apenas dentro do armazenamento protegido do app.
+- no cliente Linux atual, a protecao local cobre hash da senha e criptografia AES-GCM do armazenamento; no backend futuro, isso evolui para segredo de servidor e, idealmente, keyring/secret store do sistema operacional quando aplicavel.
 
 ## Trilhas sonoras
 
