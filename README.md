@@ -13,6 +13,8 @@ O foco do projeto e ser leve, privado e confortavel em dispositivos simples, fun
 - [MVP da etapa 1](docs/04-mvp-etapa-1.md)
 - [Backlog inicial](docs/05-backlog.md)
 - [Ambiente de desenvolvimento](docs/06-ambiente-desenvolvimento.md)
+- [Audio no Linux](docs/07-audio-linux.md)
+- [Checklist de implementacao](docs/08-checklist-implementacao.md)
 
 ## Prioridade atual
 

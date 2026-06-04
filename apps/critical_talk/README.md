@@ -25,7 +25,16 @@ O chat agora tambem suporta:
 - envio local de imagens por seletor de arquivo no Linux;
 - preview da imagem dentro da conversa.
 
-Voz, chat em tempo real, trilhas reais e upload remoto entram nas proximas fatias.
+O painel de voz agora tambem suporta:
+
+- leitura real de microfones e saidas pelo PulseAudio;
+- troca de microfone padrao;
+- troca de saida padrao;
+- mute local no cliente;
+- indicador visual de atividade de fala para o usuario local;
+- bot de teste emitindo audio no sistema para validar a saida selecionada.
+
+Chat em tempo real, captura/publicacao de voz e trilhas reais entram nas proximas fatias.
 
 ## Rodar em desenvolvimento
 

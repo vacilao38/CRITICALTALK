@@ -1,8 +1,8 @@
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_test/flutter_test.dart';
 
 import 'package:critical_talk/main.dart';
 
@@ -20,7 +20,8 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1366, 768));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    await tester.pumpWidget(CriticalTalkApp());
+    await tester.pumpWidget(_buildApp());
+    await tester.pump();
 
     expect(find.text('Critical Talk'), findsOneWidget);
     expect(find.text('Voz'), findsOneWidget);
@@ -34,10 +35,106 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1100, 820));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    await tester.pumpWidget(CriticalTalkApp());
+    await tester.pumpWidget(_buildApp());
+    await tester.pump();
 
     expect(find.text('Voz'), findsOneWidget);
     expect(find.text('Mensagem para a mesa'), findsOneWidget);
+  });
+
+  testWidgets('shows detected audio devices and allows switching output', (
+    WidgetTester tester,
+  ) async {
+    final audioService = FakeAudioControlService();
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(_buildApp(audioService: audioService));
+    await tester.pump();
+
+    expect(find.textContaining('usb headset'), findsOneWidget);
+
+    await tester.tap(find.textContaining('usb headset').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.textContaining('analog speakers').last);
+    await tester.pumpAndSettle();
+
+    expect(audioService.selectedOutputId, 'alsa_output.analog-speakers');
+  });
+
+  testWidgets('plays the audio bot through the service', (
+    WidgetTester tester,
+  ) async {
+    final audioService = FakeAudioControlService();
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(_buildApp(audioService: audioService));
+    await tester.pump();
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Bot'));
+    await tester.pump();
+
+    expect(find.text('Emitindo teste'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 650));
+    await tester.pump();
+
+    expect(audioService.playCount, 1);
+    expect(find.text('Aguardando teste'), findsOneWidget);
+  });
+
+  testWidgets('toggles local self monitoring from the voice controls', (
+    WidgetTester tester,
+  ) async {
+    final audioService = FakeAudioControlService();
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(_buildApp(audioService: audioService));
+    await tester.pump();
+
+    expect(find.byIcon(Icons.hearing), findsOneWidget);
+    expect(find.text('Retorno local ativo'), findsNothing);
+
+    await tester.tap(find.byIcon(Icons.hearing));
+    await tester.pump();
+
+    expect(audioService.startMonitoringCount, 1);
+    expect(audioService.isMonitoring, isTrue);
+    expect(find.text('Retorno local ativo'), findsOneWidget);
+    expect(find.byIcon(Icons.hearing_disabled), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.hearing_disabled));
+    await tester.pump();
+
+    expect(audioService.stopMonitoringCount, 1);
+    expect(audioService.isMonitoring, isFalse);
+    expect(find.text('Retorno local ativo'), findsNothing);
+    expect(find.byIcon(Icons.hearing), findsOneWidget);
+  });
+
+  testWidgets('highlights the local participant when input level rises', (
+    WidgetTester tester,
+  ) async {
+    final audioService = FakeAudioControlService(
+      inputLevels: const [0.02, 0.34, 0.09],
+    );
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(_buildApp(audioService: audioService));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 260));
+    await tester.pump();
+
+    expect(find.text('VOCE'), findsOneWidget);
+    expect(find.text('Falando agora'), findsOneWidget);
+    expect(find.byType(SpeakingMeter), findsWidgets);
   });
 
   testWidgets('sends a local message and receives the test bot reply', (
@@ -46,7 +143,8 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1366, 768));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    await tester.pumpWidget(CriticalTalkApp());
+    await tester.pumpWidget(_buildApp());
+    await tester.pump();
 
     await tester.enterText(
       find.widgetWithText(TextField, 'Mensagem para a mesa'),
@@ -71,7 +169,8 @@ void main() {
     await tester.binding.setSurfaceSize(const Size(1366, 768));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
-    await tester.pumpWidget(CriticalTalkApp());
+    await tester.pumpWidget(_buildApp());
+    await tester.pump();
 
     await tester.enterText(
       find.widgetWithText(TextField, 'Mensagem para a mesa'),
@@ -99,11 +198,12 @@ void main() {
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
     await tester.pumpWidget(
-      CriticalTalkApp(
+      _buildApp(
         imagePicker: () async =>
             SelectedChatImage(name: 'mapa.png', bytes: _fakeImageBytes),
       ),
     );
+    await tester.pump();
 
     await tester.tap(find.byIcon(Icons.add_photo_alternate));
     await tester.pump();
@@ -116,6 +216,110 @@ void main() {
 
     expect(find.text('mensagem recebida'), findsOneWidget);
   });
+}
+
+Widget _buildApp({
+  ChatImagePicker imagePicker = _defaultImagePicker,
+  AudioControlService? audioService,
+}) {
+  return CriticalTalkApp(
+    imagePicker: imagePicker,
+    audioService: audioService ?? FakeAudioControlService(),
+  );
+}
+
+Future<SelectedChatImage?> _defaultImagePicker() async => null;
+
+class FakeAudioControlService extends AudioControlService {
+  FakeAudioControlService({
+    this.snapshot = const AudioSnapshot(
+      inputs: [
+        AudioDevice(
+          id: 'alsa_input.usb-mic',
+          label: 'usb mic',
+          state: 'RUNNING',
+        ),
+      ],
+      outputs: [
+        AudioDevice(
+          id: 'alsa_output.usb-headset',
+          label: 'usb headset',
+          state: 'SUSPENDED',
+        ),
+        AudioDevice(
+          id: 'alsa_output.analog-speakers',
+          label: 'analog speakers',
+          state: 'RUNNING',
+        ),
+      ],
+      defaultInputId: 'alsa_input.usb-mic',
+      defaultOutputId: 'alsa_output.usb-headset',
+      serverReachable: true,
+    ),
+    this.inputLevels = const [0.01, 0.01, 0.01],
+  });
+
+  final AudioSnapshot snapshot;
+  final List<double> inputLevels;
+  int _playCounter = 0;
+  String? _selectedOutputId;
+  bool _isMonitoring = false;
+  int _startMonitoringCount = 0;
+  int _stopMonitoringCount = 0;
+
+  int get playCount => _playCounter;
+  String? get selectedOutputId => _selectedOutputId;
+  bool get isMonitoring => _isMonitoring;
+  int get startMonitoringCount => _startMonitoringCount;
+  int get stopMonitoringCount => _stopMonitoringCount;
+
+  @override
+  Future<AudioSnapshot> loadSnapshot() async {
+    _selectedOutputId = snapshot.defaultOutputId;
+    return snapshot;
+  }
+
+  @override
+  Future<void> playBotTestAudio({String? outputId}) async {
+    _playCounter++;
+    _selectedOutputId = outputId;
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+  }
+
+  @override
+  Stream<double> watchInputLevels({String? inputId}) {
+    return Stream<double>.periodic(
+      const Duration(milliseconds: 120),
+      (index) => inputLevels[index % inputLevels.length],
+    );
+  }
+
+  @override
+  Future<AudioSnapshot> setDefaultInput(String inputId) async {
+    return snapshot.copyWith(defaultInputId: inputId);
+  }
+
+  @override
+  Future<AudioSnapshot> setDefaultOutput(String outputId) async {
+    _selectedOutputId = outputId;
+    return snapshot.copyWith(defaultOutputId: outputId);
+  }
+
+  @override
+  Future<void> startInputMonitoring({
+    required String inputId,
+    required String outputId,
+  }) async {
+    _startMonitoringCount++;
+    _isMonitoring = true;
+    _selectedOutputId = outputId;
+  }
+
+  @override
+  Future<void> stopInputMonitoring() async {
+    _stopMonitoringCount++;
+    _isMonitoring = false;
+  }
 }
 
 final Uint8List _fakeImageBytes = Uint8List.fromList(<int>[

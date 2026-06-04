@@ -12,7 +12,7 @@ Opcoes:
 - React Native + Electron/Tauri: viavel, mas tende a exigir mais cola entre mobile e desktop.
 - Kotlin Multiplatform: forte para Android, mas Linux desktop pode aumentar complexidade.
 
-Direcao recomendada: Flutter, salvo se houver uma preferencia forte por outra stack.
+Decisao fechada: Flutter.
 
 ### Backend
 
@@ -29,25 +29,46 @@ Responsabilidades:
 - sincronizacao de controles de musica;
 - integracao com servico de voz.
 
-Opcoes:
+Stack final do backend:
 
-- Node.js com NestJS/Fastify e WebSocket.
-- Elixir Phoenix, excelente para tempo real.
-- Go, bom para servidor leve, mas com mais trabalho manual.
+- Node.js 20;
+- NestJS;
+- adaptador Fastify;
+- WebSocket para eventos do app;
+- PostgreSQL como banco principal;
+- Redis para presenca, cache e coordenacao leve;
+- S3/MinIO para arquivos.
 
-Direcao recomendada: Node.js/Fastify ou Phoenix. Para equipe pequena e iteracao rapida, Node.js costuma ser mais simples de contratar/manter; Phoenix e muito forte se o foco for tempo real robusto.
+Justificativa:
+
+- NestJS ajuda a organizar autenticacao, salas, emissao de tokens, WebSocket e integracoes sem deixar o projeto virar um bloco solto cedo demais.
+- Fastify mantem bom desempenho e baixo overhead.
+- Node.js conversa bem com SDKs e servicos do ecossistema realtime, inclusive LiveKit.
+- PostgreSQL atende bem usuarios, salas, membros, mensagens, regras e trilhas.
+- Redis simplifica presenca, rate limit, convites temporarios e estados curtos.
 
 ### Voz
 
 Como o projeto nao quer P2P direto, a direcao mais segura e usar WebRTC com SFU.
 
-Opcoes:
+Decisao fechada:
 
-- LiveKit self-hosted.
-- mediasoup.
-- Janus.
+- protocolo de media: WebRTC;
+- arquitetura: SFU;
+- servico escolhido: LiveKit;
+- estrategia de rollout: LiveKit self-hosted no desenvolvimento e homologacao, com opcao de migrar para LiveKit Cloud quando a operacao precisar de menos manutencao.
 
-Direcao recomendada para MVP: LiveKit self-hosted ou managed, porque reduz o volume de infraestrutura de voz que o projeto precisa manter.
+Justificativa:
+
+- O projeto precisa voz em tempo real sem P2P direto.
+- LiveKit ja entrega SFU, SDK Flutter e um caminho mais curto para publicar/receber audio do que montar mediasoup ou Janus do zero.
+- Para um grupo pequeno, self-hosted tende a ser o caminho mais barato no inicio.
+- Se a manutencao de infraestrutura passar a atrapalhar, LiveKit Cloud vira o plano B natural sem reescrever o cliente.
+
+Alternativas pagas consideradas:
+
+- Daily: boa opcao managed e simples de contratar, especialmente para audio/video sem operar SFU proprio.
+- Agora: tecnicamente madura, mas menos atraente para este projeto por causa do modelo de custo minimo mensal.
 
 ## Dados e persistencia
 
@@ -90,6 +111,35 @@ Eventos por WebSocket:
 - iniciativa;
 - regras chamadas;
 - alteracoes de cena.
+
+### Autenticacao e salas
+
+Decisao fechada:
+
+- autenticacao propria do backend;
+- contas persistentes por usuario;
+- login por email e senha;
+- tokens `access` e `refresh`;
+- salas privadas com codigo de convite;
+- membros precisam estar associados a sala para entrar;
+- token de voz do LiveKit gerado pelo backend no momento de entrar na sala;
+- papeis iniciais: `owner` e `member`.
+
+Fluxo recomendado:
+
+1. Usuario cria conta e faz login no backend.
+2. Backend entrega `access token` curto e `refresh token` longo.
+3. Usuario cria uma sala ou entra por convite.
+4. Backend valida se o usuario pertence a sala.
+5. Backend gera token curto do LiveKit para aquela sala e aquele usuario.
+6. Cliente conecta no SFU usando esse token.
+
+Justificativa:
+
+- O projeto ja precisa de identidade persistente para perfis, historico, imagens, multiplos personagens e papeis futuros.
+- Convite por sala mantem o produto privado e leve para grupo pequeno.
+- Separar token do app de token do SFU evita expor permissao de voz fora do controle do backend.
+- Email e senha sao mais simples de implementar e operar do que OAuth neste momento.
 
 ## Trilhas sonoras
 
@@ -137,10 +187,9 @@ Evoluir depois para vantagem/desvantagem, rolagem escondida e macros.
 - GIFs e imagens pesados em celulares de entrada.
 - Escopo de RPG crescer rapido demais antes do nucleo ficar estavel.
 
-## Decisoes abertas
+## Decisoes em aberto
 
-- O app tera login permanente ou entrada por convite/nome temporario?
-- As salas serao criadas por um mestre fixo?
-- Mensagens devem ser criptografadas ponta a ponta ou apenas protegidas no transporte?
-- O historico de chat sera permanente ou apagado apos a sessao?
-- O projeto aceitara trilhas enviadas pelo mestre como arquivo proprio?
+- Se o `owner` podera promover outro membro a administrador depois.
+- Se o historico de chat sera permanente ou apagado por sala/sessao.
+- Se trilhas proprias enviadas pelo mestre entram ja na etapa 1 ou depois.
+- Se a migracao para LiveKit Cloud sera necessaria antes do Android entrar.

@@ -1,19 +1,29 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:path/path.dart' as p;
 
 typedef ChatImagePicker = Future<SelectedChatImage?> Function();
 
 void main() {
-  runApp(CriticalTalkApp());
+  runApp(const CriticalTalkApp());
 }
 
 class CriticalTalkApp extends StatelessWidget {
-  const CriticalTalkApp({super.key, this.imagePicker = pickChatImage});
+  const CriticalTalkApp({
+    super.key,
+    this.imagePicker = pickChatImage,
+    this.audioService = const LinuxAudioControlService(),
+  });
 
   final ChatImagePicker imagePicker;
+  final AudioControlService audioService;
 
   @override
   Widget build(BuildContext context) {
@@ -28,7 +38,7 @@ class CriticalTalkApp extends StatelessWidget {
         scaffoldBackgroundColor: const Color(0xFF151719),
         useMaterial3: true,
       ),
-      home: SessionShell(imagePicker: imagePicker),
+      home: SessionShell(imagePicker: imagePicker, audioService: audioService),
     );
   }
 }
@@ -50,10 +60,405 @@ Future<SelectedChatImage?> pickChatImage() async {
   return SelectedChatImage(name: file.name, bytes: bytes);
 }
 
+abstract class AudioControlService {
+  const AudioControlService();
+
+  Future<AudioSnapshot> loadSnapshot();
+
+  Future<AudioSnapshot> setDefaultInput(String inputId);
+
+  Future<AudioSnapshot> setDefaultOutput(String outputId);
+
+  Future<void> playBotTestAudio({String? outputId});
+
+  Stream<double> watchInputLevels({String? inputId});
+
+  Future<void> startInputMonitoring({
+    required String inputId,
+    required String outputId,
+  });
+
+  Future<void> stopInputMonitoring();
+}
+
+class LinuxAudioControlService extends AudioControlService {
+  const LinuxAudioControlService();
+
+  static const _audioEnv = <String, String>{'LANG': 'C', 'LC_ALL': 'C'};
+  static Process? _monitorCaptureProcess;
+  static Process? _monitorPlaybackProcess;
+  static StreamSubscription<List<int>>? _monitorPipeSubscription;
+
+  @override
+  Future<AudioSnapshot> loadSnapshot() async {
+    try {
+      final infoResult = await Process.run('pactl', const [
+        'info',
+      ], environment: _audioEnv);
+      final sourcesResult = await Process.run('pactl', const [
+        'list',
+        'short',
+        'sources',
+      ], environment: _audioEnv);
+      final sinksResult = await Process.run('pactl', const [
+        'list',
+        'short',
+        'sinks',
+      ], environment: _audioEnv);
+
+      if (infoResult.exitCode != 0 ||
+          sourcesResult.exitCode != 0 ||
+          sinksResult.exitCode != 0) {
+        return AudioSnapshot.unavailable(
+          error: _cleanError(
+            [
+              infoResult.stderr,
+              sourcesResult.stderr,
+              sinksResult.stderr,
+            ].join('\n'),
+          ),
+        );
+      }
+
+      final info = _parsePactlInfo(infoResult.stdout.toString());
+      final inputs = _parsePactlList(
+        sourcesResult.stdout.toString(),
+      ).where((device) => !device.id.endsWith('.monitor')).toList();
+      final outputs = _parsePactlList(sinksResult.stdout.toString());
+
+      return AudioSnapshot(
+        inputs: inputs,
+        outputs: outputs,
+        defaultInputId: info.defaultSourceId,
+        defaultOutputId: info.defaultSinkId,
+        serverReachable: true,
+      );
+    } on ProcessException catch (error) {
+      return AudioSnapshot.unavailable(error: error.message);
+    }
+  }
+
+  @override
+  Future<AudioSnapshot> setDefaultInput(String inputId) async {
+    final result = await Process.run('pactl', [
+      'set-default-source',
+      inputId,
+    ], environment: _audioEnv);
+
+    if (result.exitCode != 0) {
+      return AudioSnapshot.unavailable(
+        error: _cleanError(result.stderr.toString()),
+      );
+    }
+
+    return loadSnapshot();
+  }
+
+  @override
+  Future<AudioSnapshot> setDefaultOutput(String outputId) async {
+    final result = await Process.run('pactl', [
+      'set-default-sink',
+      outputId,
+    ], environment: _audioEnv);
+
+    if (result.exitCode != 0) {
+      return AudioSnapshot.unavailable(
+        error: _cleanError(result.stderr.toString()),
+      );
+    }
+
+    return loadSnapshot();
+  }
+
+  @override
+  Future<void> playBotTestAudio({String? outputId}) async {
+    final file = File(
+      p.join(
+        Directory.systemTemp.path,
+        'critical-talk-bot-${DateTime.now().millisecondsSinceEpoch}.wav',
+      ),
+    );
+
+    await file.writeAsBytes(_generateTestWaveBytes(), flush: true);
+
+    final arguments = <String>[
+      if (outputId != null && outputId.isNotEmpty) '--device=$outputId',
+      file.path,
+    ];
+
+    try {
+      final process = await Process.start(
+        'paplay',
+        arguments,
+        environment: _audioEnv,
+      );
+      final stderrBuffer = StringBuffer();
+
+      process.stderr.transform(utf8.decoder).listen(stderrBuffer.write);
+
+      final exitCode = await process.exitCode;
+
+      if (exitCode != 0) {
+        throw AudioServiceException(
+          _cleanError(stderrBuffer.toString()).ifEmpty('Falha ao tocar audio.'),
+        );
+      }
+    } on ProcessException catch (error) {
+      throw AudioServiceException(error.message);
+    } finally {
+      if (await file.exists()) {
+        await file.delete();
+      }
+    }
+  }
+
+  @override
+  Stream<double> watchInputLevels({String? inputId}) {
+    Process? process;
+    StreamSubscription<List<int>>? stdoutSubscription;
+    StreamSubscription<List<int>>? stderrSubscription;
+
+    final controller = StreamController<double>();
+
+    Future<void> disposeProcess() async {
+      await stdoutSubscription?.cancel();
+      await stderrSubscription?.cancel();
+      process?.kill(ProcessSignal.sigterm);
+      process = null;
+    }
+
+    controller.onListen = () async {
+      try {
+        process = await Process.start('parec', <String>[
+          '--raw',
+          '--rate=16000',
+          '--channels=1',
+          '--format=s16le',
+          if (inputId != null && inputId.isNotEmpty) '--device=$inputId',
+        ], environment: _audioEnv);
+      } on ProcessException {
+        if (!controller.isClosed) {
+          controller.add(0);
+          await controller.close();
+        }
+        return;
+      }
+
+      stdoutSubscription = process!.stdout.listen((chunk) {
+        if (chunk.isEmpty || controller.isClosed) {
+          return;
+        }
+
+        controller.add(_computeNormalizedLevel(Uint8List.fromList(chunk)));
+      });
+
+      stderrSubscription = process!.stderr.listen((_) {});
+
+      unawaited(
+        process!.exitCode.then((_) async {
+          if (!controller.isClosed) {
+            controller.add(0);
+            await controller.close();
+          }
+        }),
+      );
+    };
+
+    controller.onCancel = () async {
+      await disposeProcess();
+    };
+
+    return controller.stream;
+  }
+
+  @override
+  Future<void> startInputMonitoring({
+    required String inputId,
+    required String outputId,
+  }) async {
+    await stopInputMonitoring();
+
+    try {
+      final capture = await Process.start('parec', <String>[
+        '--raw',
+        '--rate=16000',
+        '--channels=1',
+        '--format=s16le',
+        '--latency-msec=20',
+        '--device=$inputId',
+      ], environment: _audioEnv);
+
+      final playback = await Process.start('pacat', <String>[
+        '--playback',
+        '--raw',
+        '--rate=16000',
+        '--channels=1',
+        '--format=s16le',
+        '--latency-msec=20',
+        '--device=$outputId',
+      ], environment: _audioEnv);
+
+      _monitorCaptureProcess = capture;
+      _monitorPlaybackProcess = playback;
+      _monitorPipeSubscription = capture.stdout.listen(
+        playback.stdin.add,
+        onDone: () async {
+          await playback.stdin.close();
+        },
+      );
+
+      unawaited(capture.stderr.drain<void>());
+      unawaited(playback.stderr.drain<void>());
+    } on ProcessException catch (error) {
+      await stopInputMonitoring();
+      throw AudioServiceException(error.message);
+    }
+  }
+
+  @override
+  Future<void> stopInputMonitoring() async {
+    await _monitorPipeSubscription?.cancel();
+    _monitorPipeSubscription = null;
+
+    try {
+      await _monitorPlaybackProcess?.stdin.close();
+    } catch (_) {}
+
+    _monitorCaptureProcess?.kill(ProcessSignal.sigterm);
+    _monitorPlaybackProcess?.kill(ProcessSignal.sigterm);
+    _monitorCaptureProcess = null;
+    _monitorPlaybackProcess = null;
+  }
+
+  List<AudioDevice> _parsePactlList(String rawOutput) {
+    return rawOutput
+        .split('\n')
+        .where((line) => line.trim().isNotEmpty)
+        .map((line) {
+          final columns = line.split('\t');
+          final id = columns.length > 1 ? columns[1] : '';
+          final state = columns.isNotEmpty ? columns.last : 'UNKNOWN';
+
+          return AudioDevice(
+            id: id,
+            label: _humanizeAudioDeviceLabel(id),
+            state: state,
+          );
+        })
+        .where((device) => device.id.isNotEmpty)
+        .toList();
+  }
+
+  AudioDefaults _parsePactlInfo(String rawOutput) {
+    String? defaultSinkId;
+    String? defaultSourceId;
+
+    for (final line in rawOutput.split('\n')) {
+      if (line.startsWith('Default Sink:')) {
+        defaultSinkId = line.split(':').skip(1).join(':').trim();
+      } else if (line.startsWith('Default Source:')) {
+        defaultSourceId = line.split(':').skip(1).join(':').trim();
+      }
+    }
+
+    return AudioDefaults(
+      defaultSinkId: defaultSinkId,
+      defaultSourceId: defaultSourceId,
+    );
+  }
+
+  Uint8List _generateTestWaveBytes() {
+    const sampleRate = 44100;
+    const durationSeconds = 2.0;
+    const channels = 1;
+    const bitsPerSample = 16;
+    const frequency = 523.25;
+    final totalSamples = (sampleRate * durationSeconds).toInt();
+    final pcmBytes = BytesBuilder();
+
+    for (var index = 0; index < totalSamples; index++) {
+      final ramp = math.min(index / (sampleRate * 0.05), 1.0);
+      final fadeOut = math.min(
+        (totalSamples - index) / (sampleRate * 0.08),
+        1.0,
+      );
+      final envelope = ramp * fadeOut;
+      final sample =
+          math.sin(2 * math.pi * frequency * (index / sampleRate)) *
+          envelope *
+          0.35;
+      final value = (sample * 32767).round();
+      final bytes = ByteData(2)..setInt16(0, value, Endian.little);
+      pcmBytes.add(bytes.buffer.asUint8List());
+    }
+
+    final pcmData = pcmBytes.toBytes();
+    final byteRate = sampleRate * channels * bitsPerSample ~/ 8;
+    final blockAlign = channels * bitsPerSample ~/ 8;
+    final header = ByteData(44)
+      ..setUint32(0, 0x52494646, Endian.big)
+      ..setUint32(4, 36 + pcmData.length, Endian.little)
+      ..setUint32(8, 0x57415645, Endian.big)
+      ..setUint32(12, 0x666d7420, Endian.big)
+      ..setUint32(16, 16, Endian.little)
+      ..setUint16(20, 1, Endian.little)
+      ..setUint16(22, channels, Endian.little)
+      ..setUint32(24, sampleRate, Endian.little)
+      ..setUint32(28, byteRate, Endian.little)
+      ..setUint16(32, blockAlign, Endian.little)
+      ..setUint16(34, bitsPerSample, Endian.little)
+      ..setUint32(36, 0x64617461, Endian.big)
+      ..setUint32(40, pcmData.length, Endian.little);
+
+    return Uint8List.fromList([...header.buffer.asUint8List(), ...pcmData]);
+  }
+
+  String _humanizeAudioDeviceLabel(String id) {
+    return id
+        .replaceAll('alsa_output.', '')
+        .replaceAll('alsa_input.', '')
+        .replaceAll('.analog-stereo', '')
+        .replaceAll('.monitor', ' monitor')
+        .replaceAllMapped(RegExp(r'[_\.]'), (_) => ' ')
+        .trim();
+  }
+
+  String _cleanError(String stderr) {
+    return stderr
+        .split('\n')
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .join(' ');
+  }
+
+  double _computeNormalizedLevel(Uint8List bytes) {
+    if (bytes.length < 2) {
+      return 0;
+    }
+
+    final byteData = ByteData.sublistView(bytes);
+    final sampleCount = bytes.length ~/ 2;
+    var sum = 0.0;
+
+    for (var offset = 0; offset < sampleCount; offset++) {
+      final sample = byteData.getInt16(offset * 2, Endian.little) / 32768.0;
+      sum += sample * sample;
+    }
+
+    final rms = math.sqrt(sum / sampleCount);
+    return (rms * 4.5).clamp(0.0, 1.0);
+  }
+}
+
 class SessionShell extends StatefulWidget {
-  const SessionShell({required this.imagePicker, super.key});
+  const SessionShell({
+    required this.imagePicker,
+    required this.audioService,
+    super.key,
+  });
 
   final ChatImagePicker imagePicker;
+  final AudioControlService audioService;
 
   @override
   State<SessionShell> createState() => _SessionShellState();
@@ -75,7 +480,201 @@ class _SessionShellState extends State<SessionShell> {
     ),
   ].toList();
 
+  AudioSnapshot _audioSnapshot = AudioSnapshot.loading();
   bool _isPickingImage = false;
+  bool _isAudioBusy = false;
+  bool _isBotPlaying = false;
+  bool _isMicMuted = false;
+  bool _isSelfMonitoring = false;
+  double _selfInputLevel = 0;
+  StreamSubscription<double>? _inputLevelSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadAudioSnapshot());
+  }
+
+  @override
+  void dispose() {
+    _inputLevelSubscription?.cancel();
+    unawaited(widget.audioService.stopInputMonitoring());
+    super.dispose();
+  }
+
+  Future<void> _loadAudioSnapshot() async {
+    setState(() {
+      _isAudioBusy = true;
+    });
+
+    final snapshot = await widget.audioService.loadSnapshot();
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _audioSnapshot = snapshot;
+      _isAudioBusy = false;
+    });
+
+    _syncInputLevelMonitoring();
+  }
+
+  Future<void> _selectInput(String inputId) async {
+    setState(() {
+      _isAudioBusy = true;
+    });
+
+    final snapshot = await widget.audioService.setDefaultInput(inputId);
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _audioSnapshot = snapshot;
+      _isAudioBusy = false;
+    });
+
+    _syncInputLevelMonitoring();
+  }
+
+  Future<void> _selectOutput(String outputId) async {
+    setState(() {
+      _isAudioBusy = true;
+    });
+
+    final snapshot = await widget.audioService.setDefaultOutput(outputId);
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _audioSnapshot = snapshot;
+      _isAudioBusy = false;
+    });
+
+    _syncInputLevelMonitoring();
+  }
+
+  Future<void> _playBotTestAudio() async {
+    if (_isBotPlaying || _isAudioBusy) {
+      return;
+    }
+
+    setState(() {
+      _isBotPlaying = true;
+      _isAudioBusy = true;
+    });
+
+    try {
+      await widget.audioService.playBotTestAudio(
+        outputId: _audioSnapshot.defaultOutputId,
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _audioSnapshot = _audioSnapshot.copyWith(error: error.toString());
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBotPlaying = false;
+          _isAudioBusy = false;
+        });
+      }
+    }
+  }
+
+  void _toggleMute() {
+    setState(() {
+      _isMicMuted = !_isMicMuted;
+      if (_isMicMuted) {
+        _selfInputLevel = 0;
+      }
+    });
+
+    _syncInputLevelMonitoring();
+  }
+
+  Future<void> _toggleSelfMonitoring() async {
+    if (_audioSnapshot.defaultInputId == null ||
+        _audioSnapshot.defaultOutputId == null) {
+      return;
+    }
+
+    setState(() {
+      _isAudioBusy = true;
+    });
+
+    try {
+      if (_isSelfMonitoring) {
+        await widget.audioService.stopInputMonitoring();
+      } else {
+        await widget.audioService.startInputMonitoring(
+          inputId: _audioSnapshot.defaultInputId!,
+          outputId: _audioSnapshot.defaultOutputId!,
+        );
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _isSelfMonitoring = !_isSelfMonitoring;
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _audioSnapshot = _audioSnapshot.copyWith(error: error.toString());
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isAudioBusy = false;
+        });
+      }
+    }
+  }
+
+  void _syncInputLevelMonitoring() {
+    _inputLevelSubscription?.cancel();
+    _inputLevelSubscription = null;
+
+    if (_isMicMuted ||
+        !_audioSnapshot.serverReachable ||
+        _audioSnapshot.defaultInputId == null) {
+      if (mounted && _selfInputLevel != 0) {
+        setState(() {
+          _selfInputLevel = 0;
+        });
+      }
+      return;
+    }
+
+    _inputLevelSubscription = widget.audioService
+        .watchInputLevels(inputId: _audioSnapshot.defaultInputId)
+        .listen((level) {
+          if (!mounted) {
+            return;
+          }
+
+          final smoothed = (_selfInputLevel * 0.55) + (level * 0.45);
+
+          setState(() {
+            _selfInputLevel = smoothed < 0.015 ? 0 : smoothed;
+          });
+        });
+  }
 
   void _queueBotReply() {
     Future<void>.delayed(const Duration(milliseconds: 450), () {
@@ -161,17 +760,41 @@ class _SessionShellState extends State<SessionShell> {
                           if (compact) {
                             return CompactSessionLayout(
                               messages: _messages,
+                              audioSnapshot: _audioSnapshot,
+                              isAudioBusy: _isAudioBusy,
+                              isBotPlaying: _isBotPlaying,
+                              isMicMuted: _isMicMuted,
+                              isSelfMonitoring: _isSelfMonitoring,
+                              selfInputLevel: _selfInputLevel,
                               onMessageSubmitted: _sendMessage,
                               onImageRequested: _sendImage,
                               isPickingImage: _isPickingImage,
+                              onRefreshAudio: _loadAudioSnapshot,
+                              onPlayBotAudio: _playBotTestAudio,
+                              onToggleSelfMonitoring: _toggleSelfMonitoring,
+                              onInputSelected: _selectInput,
+                              onOutputSelected: _selectOutput,
+                              onToggleMute: _toggleMute,
                             );
                           }
 
                           return WideSessionLayout(
                             messages: _messages,
+                            audioSnapshot: _audioSnapshot,
+                            isAudioBusy: _isAudioBusy,
+                            isBotPlaying: _isBotPlaying,
+                            isMicMuted: _isMicMuted,
+                            isSelfMonitoring: _isSelfMonitoring,
+                            selfInputLevel: _selfInputLevel,
                             onMessageSubmitted: _sendMessage,
                             onImageRequested: _sendImage,
                             isPickingImage: _isPickingImage,
+                            onRefreshAudio: _loadAudioSnapshot,
+                            onPlayBotAudio: _playBotTestAudio,
+                            onToggleSelfMonitoring: _toggleSelfMonitoring,
+                            onInputSelected: _selectInput,
+                            onOutputSelected: _selectOutput,
+                            onToggleMute: _toggleMute,
                           );
                         },
                       ),
@@ -190,23 +813,63 @@ class _SessionShellState extends State<SessionShell> {
 class WideSessionLayout extends StatelessWidget {
   const WideSessionLayout({
     required this.messages,
+    required this.audioSnapshot,
+    required this.isAudioBusy,
+    required this.isBotPlaying,
+    required this.isMicMuted,
+    required this.isSelfMonitoring,
+    required this.selfInputLevel,
     required this.onMessageSubmitted,
     required this.onImageRequested,
     required this.isPickingImage,
+    required this.onRefreshAudio,
+    required this.onPlayBotAudio,
+    required this.onToggleSelfMonitoring,
+    required this.onInputSelected,
+    required this.onOutputSelected,
+    required this.onToggleMute,
     super.key,
   });
 
   final List<ChatMessage> messages;
+  final AudioSnapshot audioSnapshot;
+  final bool isAudioBusy;
+  final bool isBotPlaying;
+  final bool isMicMuted;
+  final bool isSelfMonitoring;
+  final double selfInputLevel;
   final ValueChanged<String> onMessageSubmitted;
   final Future<void> Function() onImageRequested;
   final bool isPickingImage;
+  final Future<void> Function() onRefreshAudio;
+  final Future<void> Function() onPlayBotAudio;
+  final Future<void> Function() onToggleSelfMonitoring;
+  final ValueChanged<String> onInputSelected;
+  final ValueChanged<String> onOutputSelected;
+  final VoidCallback onToggleMute;
 
   @override
   Widget build(BuildContext context) {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const SizedBox(width: 288, child: VoicePanel()),
+        SizedBox(
+          width: 288,
+          child: VoicePanel(
+            snapshot: audioSnapshot,
+            isAudioBusy: isAudioBusy,
+            isBotPlaying: isBotPlaying,
+            isMicMuted: isMicMuted,
+            isSelfMonitoring: isSelfMonitoring,
+            selfInputLevel: selfInputLevel,
+            onRefreshAudio: onRefreshAudio,
+            onPlayBotAudio: onPlayBotAudio,
+            onToggleSelfMonitoring: onToggleSelfMonitoring,
+            onInputSelected: onInputSelected,
+            onOutputSelected: onOutputSelected,
+            onToggleMute: onToggleMute,
+          ),
+        ),
         const SizedBox(width: 12),
         Expanded(
           child: CenterColumn(
@@ -226,22 +889,62 @@ class WideSessionLayout extends StatelessWidget {
 class CompactSessionLayout extends StatelessWidget {
   const CompactSessionLayout({
     required this.messages,
+    required this.audioSnapshot,
+    required this.isAudioBusy,
+    required this.isBotPlaying,
+    required this.isMicMuted,
+    required this.isSelfMonitoring,
+    required this.selfInputLevel,
     required this.onMessageSubmitted,
     required this.onImageRequested,
     required this.isPickingImage,
+    required this.onRefreshAudio,
+    required this.onPlayBotAudio,
+    required this.onToggleSelfMonitoring,
+    required this.onInputSelected,
+    required this.onOutputSelected,
+    required this.onToggleMute,
     super.key,
   });
 
   final List<ChatMessage> messages;
+  final AudioSnapshot audioSnapshot;
+  final bool isAudioBusy;
+  final bool isBotPlaying;
+  final bool isMicMuted;
+  final bool isSelfMonitoring;
+  final double selfInputLevel;
   final ValueChanged<String> onMessageSubmitted;
   final Future<void> Function() onImageRequested;
   final bool isPickingImage;
+  final Future<void> Function() onRefreshAudio;
+  final Future<void> Function() onPlayBotAudio;
+  final Future<void> Function() onToggleSelfMonitoring;
+  final ValueChanged<String> onInputSelected;
+  final ValueChanged<String> onOutputSelected;
+  final VoidCallback onToggleMute;
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
-        const SizedBox(height: 180, child: VoicePanel()),
+        SizedBox(
+          height: 244,
+          child: VoicePanel(
+            snapshot: audioSnapshot,
+            isAudioBusy: isAudioBusy,
+            isBotPlaying: isBotPlaying,
+            isMicMuted: isMicMuted,
+            isSelfMonitoring: isSelfMonitoring,
+            selfInputLevel: selfInputLevel,
+            onRefreshAudio: onRefreshAudio,
+            onPlayBotAudio: onPlayBotAudio,
+            onToggleSelfMonitoring: onToggleSelfMonitoring,
+            onInputSelected: onInputSelected,
+            onOutputSelected: onOutputSelected,
+            onToggleMute: onToggleMute,
+          ),
+        ),
         const SizedBox(height: 12),
         Expanded(
           child: Row(
@@ -411,24 +1114,122 @@ class HeaderPill extends StatelessWidget {
 }
 
 class VoicePanel extends StatelessWidget {
-  const VoicePanel({super.key});
+  const VoicePanel({
+    required this.snapshot,
+    required this.isAudioBusy,
+    required this.isBotPlaying,
+    required this.isMicMuted,
+    required this.isSelfMonitoring,
+    required this.selfInputLevel,
+    required this.onRefreshAudio,
+    required this.onPlayBotAudio,
+    required this.onToggleSelfMonitoring,
+    required this.onInputSelected,
+    required this.onOutputSelected,
+    required this.onToggleMute,
+    super.key,
+  });
 
-  static const participants = [
-    Participant('Mestre', 'RO', 'Falando', Color(0xFF55BCA4), true),
-    Participant('Mira', 'MI', 'Microfone aberto', Color(0xFFE6B450), false),
-    Participant('Darian', 'DA', 'Silenciado', Color(0xFF9BA7FF), false),
-    Participant('Noctua', 'NO', 'Microfone aberto', Color(0xFFDE706B), false),
+  final AudioSnapshot snapshot;
+  final bool isAudioBusy;
+  final bool isBotPlaying;
+  final bool isMicMuted;
+  final bool isSelfMonitoring;
+  final double selfInputLevel;
+  final Future<void> Function() onRefreshAudio;
+  final Future<void> Function() onPlayBotAudio;
+  final Future<void> Function() onToggleSelfMonitoring;
+  final ValueChanged<String> onInputSelected;
+  final ValueChanged<String> onOutputSelected;
+  final VoidCallback onToggleMute;
+
+  static const _partyMembers = [
+    ParticipantView(
+      name: 'Mestre',
+      initials: 'ME',
+      status: 'Na chamada',
+      color: Color(0xFF55BCA4),
+    ),
+    ParticipantView(
+      name: 'Mira',
+      initials: 'MI',
+      status: 'Microfone aberto',
+      color: Color(0xFFE6B450),
+    ),
+    ParticipantView(
+      name: 'Darian',
+      initials: 'DA',
+      status: 'Pronto para combate',
+      color: Color(0xFF9BA7FF),
+    ),
   ];
 
   @override
   Widget build(BuildContext context) {
+    final participants = [
+      ParticipantView(
+        name: 'Rogerin',
+        initials: 'RO',
+        status: isMicMuted
+            ? 'Silenciado'
+            : isSelfMonitoring
+            ? 'Retorno local ativo'
+            : selfInputLevel > 0.08
+            ? 'Falando agora'
+            : 'Microfone aberto',
+        color: const Color(0xFF55BCA4),
+        speaking: !isMicMuted && selfInputLevel > 0.08,
+        level: isMicMuted ? 0 : selfInputLevel,
+        isSelf: true,
+      ),
+      ..._partyMembers,
+      ParticipantView(
+        name: 'Bot de Audio',
+        initials: 'BT',
+        status: isBotPlaying ? 'Emitindo teste' : 'Aguardando teste',
+        color: const Color(0xFFDE706B),
+        speaking: isBotPlaying,
+        level: isBotPlaying ? 0.85 : 0,
+      ),
+    ];
+
     return Panel(
       title: 'Voz',
-      trailing: IconToolButton(icon: Icons.tune, label: 'Dispositivos'),
+      trailing: IconToolButton(
+        icon: Icons.refresh,
+        label: 'Atualizar audio',
+        onPressed: isAudioBusy ? null : onRefreshAudio,
+      ),
       child: SingleChildScrollView(
         child: Column(
           children: [
-            const DeviceStrip(),
+            DevicePickerRow(
+              icon: Icons.mic,
+              label: 'Microfone',
+              devices: snapshot.inputs,
+              selectedId: snapshot.defaultInputId,
+              enabled: snapshot.inputs.isNotEmpty && !isAudioBusy,
+              emptyLabel: snapshot.serverReachable
+                  ? 'Nenhum microfone disponivel'
+                  : 'PulseAudio indisponivel',
+              onChanged: onInputSelected,
+            ),
+            const SizedBox(height: 8),
+            DevicePickerRow(
+              icon: Icons.volume_up,
+              label: 'Saida',
+              devices: snapshot.outputs,
+              selectedId: snapshot.defaultOutputId,
+              enabled: snapshot.outputs.isNotEmpty && !isAudioBusy,
+              emptyLabel: snapshot.serverReachable
+                  ? 'Nenhuma saida disponivel'
+                  : 'PulseAudio indisponivel',
+              onChanged: onOutputSelected,
+            ),
+            if (snapshot.error != null) ...[
+              const SizedBox(height: 8),
+              ErrorStrip(message: snapshot.error!),
+            ],
             const SizedBox(height: 12),
             ...participants.map(
               (participant) => Padding(
@@ -437,7 +1238,15 @@ class VoicePanel extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 4),
-            const VoiceControls(),
+            VoiceControls(
+              isMicMuted: isMicMuted,
+              isAudioBusy: isAudioBusy,
+              isBotPlaying: isBotPlaying,
+              isSelfMonitoring: isSelfMonitoring,
+              onToggleMute: onToggleMute,
+              onPlayBotAudio: onPlayBotAudio,
+              onToggleSelfMonitoring: onToggleSelfMonitoring,
+            ),
           ],
         ),
       ),
@@ -445,37 +1254,30 @@ class VoicePanel extends StatelessWidget {
   }
 }
 
-class DeviceStrip extends StatelessWidget {
-  const DeviceStrip({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: const [
-        DeviceRow(icon: Icons.mic, label: 'Microfone', value: 'Yeti Nano'),
-        SizedBox(height: 8),
-        DeviceRow(icon: Icons.volume_up, label: 'Saida', value: 'Headset USB'),
-      ],
-    );
-  }
-}
-
-class DeviceRow extends StatelessWidget {
-  const DeviceRow({
+class DevicePickerRow extends StatelessWidget {
+  const DevicePickerRow({
     required this.icon,
     required this.label,
-    required this.value,
+    required this.devices,
+    required this.selectedId,
+    required this.enabled,
+    required this.emptyLabel,
+    required this.onChanged,
     super.key,
   });
 
   final IconData icon;
   final String label;
-  final String value;
+  final List<AudioDevice> devices;
+  final String? selectedId;
+  final bool enabled;
+  final String emptyLabel;
+  final ValueChanged<String> onChanged;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 42,
+      height: 50,
       padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: BoxDecoration(
         color: const Color(0xFF1A1D20),
@@ -485,15 +1287,107 @@ class DeviceRow extends StatelessWidget {
         children: [
           Icon(icon, size: 18, color: const Color(0xFF9FC5BA)),
           const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              '$label: $value',
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 13),
-            ),
+          SizedBox(
+            width: 84,
+            child: Text(label, style: const TextStyle(fontSize: 13)),
           ),
-          const Icon(Icons.expand_more, size: 18, color: Color(0xFF8E9996)),
+          Expanded(
+            child: enabled
+                ? DropdownButtonHideUnderline(
+                    child: DropdownButton<String>(
+                      value: devices.any((device) => device.id == selectedId)
+                          ? selectedId
+                          : devices.first.id,
+                      isExpanded: true,
+                      dropdownColor: const Color(0xFF202326),
+                      items: devices
+                          .map(
+                            (device) => DropdownMenuItem<String>(
+                              value: device.id,
+                              child: Text(
+                                device.summary,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          )
+                          .toList(),
+                      onChanged: (value) {
+                        if (value != null) {
+                          onChanged(value);
+                        }
+                      },
+                    ),
+                  )
+                : Text(
+                    emptyLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Color(0xFF8E9996),
+                      fontSize: 13,
+                    ),
+                  ),
+          ),
         ],
+      ),
+    );
+  }
+}
+
+class ErrorStrip extends StatelessWidget {
+  const ErrorStrip({required this.message, super.key});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF4A2323),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        message,
+        maxLines: 3,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(color: Color(0xFFFFC0BA), fontSize: 12),
+      ),
+    );
+  }
+}
+
+class SpeakingMeter extends StatelessWidget {
+  const SpeakingMeter({required this.level, super.key});
+
+  final double level;
+
+  @override
+  Widget build(BuildContext context) {
+    final normalized = level.clamp(0.0, 1.0);
+
+    return SizedBox(
+      height: 28,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: List.generate(4, (index) {
+          final threshold = (index + 1) / 4;
+          final active = normalized >= threshold - 0.12;
+          final baseHeight = 7.0 + (index * 4);
+
+          return Container(
+            width: 4,
+            height: active ? baseHeight + 4 : baseHeight,
+            margin: EdgeInsets.only(left: index == 0 ? 0 : 2),
+            decoration: BoxDecoration(
+              color: active ? const Color(0xFF80DFC8) : const Color(0xFF42514C),
+              borderRadius: BorderRadius.circular(99),
+            ),
+          );
+        }),
       ),
     );
   }
@@ -502,23 +1396,33 @@ class DeviceRow extends StatelessWidget {
 class ParticipantTile extends StatelessWidget {
   const ParticipantTile({required this.participant, super.key});
 
-  final Participant participant;
+  final ParticipantView participant;
 
   @override
   Widget build(BuildContext context) {
+    final tileColor = participant.speaking
+        ? const Color(0xFF203B36)
+        : const Color(0xFF1A1D20);
+    final borderColor = participant.speaking
+        ? const Color(0xFF55BCA4)
+        : const Color(0xFF2A2F33);
+
     return Container(
       height: 62,
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: participant.speaking
-            ? const Color(0xFF203B36)
-            : const Color(0xFF1A1D20),
+        color: tileColor,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(
-          color: participant.speaking
-              ? const Color(0xFF55BCA4)
-              : const Color(0xFF2A2F33),
-        ),
+        border: Border.all(color: borderColor),
+        boxShadow: participant.speaking
+            ? const [
+                BoxShadow(
+                  color: Color(0x4439C7A6),
+                  blurRadius: 12,
+                  spreadRadius: 1,
+                ),
+              ]
+            : null,
       ),
       child: Row(
         children: [
@@ -533,11 +1437,28 @@ class ParticipantTile extends StatelessWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  participant.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w700),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        participant.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                    if (participant.isSelf) ...[
+                      const SizedBox(width: 8),
+                      const Text(
+                        'VOCE',
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Color(0xFFBFE9DD),
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
                 const SizedBox(height: 3),
                 Text(
@@ -552,13 +1473,8 @@ class ParticipantTile extends StatelessWidget {
               ],
             ),
           ),
-          Icon(
-            participant.status == 'Silenciado' ? Icons.mic_off : Icons.mic,
-            size: 18,
-            color: participant.status == 'Silenciado'
-                ? const Color(0xFFDE706B)
-                : const Color(0xFF80DFC8),
-          ),
+          const SizedBox(width: 8),
+          SizedBox(width: 26, child: SpeakingMeter(level: participant.level)),
         ],
       ),
     );
@@ -566,7 +1482,24 @@ class ParticipantTile extends StatelessWidget {
 }
 
 class VoiceControls extends StatelessWidget {
-  const VoiceControls({super.key});
+  const VoiceControls({
+    required this.isMicMuted,
+    required this.isAudioBusy,
+    required this.isBotPlaying,
+    required this.isSelfMonitoring,
+    required this.onToggleMute,
+    required this.onPlayBotAudio,
+    required this.onToggleSelfMonitoring,
+    super.key,
+  });
+
+  final bool isMicMuted;
+  final bool isAudioBusy;
+  final bool isBotPlaying;
+  final bool isSelfMonitoring;
+  final VoidCallback onToggleMute;
+  final Future<void> Function() onPlayBotAudio;
+  final Future<void> Function() onToggleSelfMonitoring;
 
   @override
   Widget build(BuildContext context) {
@@ -574,9 +1507,9 @@ class VoiceControls extends StatelessWidget {
       children: [
         Expanded(
           child: FilledButton.icon(
-            onPressed: () {},
-            icon: const Icon(Icons.mic),
-            label: const Text('Aberto'),
+            onPressed: onToggleMute,
+            icon: Icon(isMicMuted ? Icons.mic_off : Icons.mic),
+            label: Text(isMicMuted ? 'Silenciado' : 'Aberto'),
             style: FilledButton.styleFrom(
               minimumSize: const Size.fromHeight(42),
               shape: RoundedRectangleBorder(
@@ -586,7 +1519,50 @@ class VoiceControls extends StatelessWidget {
           ),
         ),
         const SizedBox(width: 8),
-        IconToolButton(icon: Icons.headphones, label: 'Monitorar audio'),
+        Tooltip(
+          message: isSelfMonitoring
+              ? 'Desligar retorno local'
+              : 'Ouvir minha propria voz',
+          child: SizedBox(
+            width: 44,
+            height: 42,
+            child: FilledButton(
+              onPressed: isAudioBusy ? null : onToggleSelfMonitoring,
+              style: FilledButton.styleFrom(
+                padding: EdgeInsets.zero,
+                backgroundColor: isSelfMonitoring
+                    ? const Color(0xFF55BCA4)
+                    : const Color(0xFF2B3135),
+                foregroundColor: isSelfMonitoring
+                    ? const Color(0xFF10211D)
+                    : Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
+              ),
+              child: Icon(
+                isSelfMonitoring ? Icons.hearing_disabled : Icons.hearing,
+                size: 20,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        SizedBox(
+          height: 42,
+          child: FilledButton.icon(
+            onPressed: isAudioBusy || isBotPlaying ? null : onPlayBotAudio,
+            icon: const Icon(Icons.play_circle),
+            label: const Text('Bot'),
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFFE6B450),
+              foregroundColor: const Color(0xFF1A1D20),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+        ),
       ],
     );
   }
@@ -1457,20 +2433,114 @@ class AvatarBadge extends StatelessWidget {
   }
 }
 
-class Participant {
-  const Participant(
-    this.name,
-    this.initials,
-    this.status,
-    this.color,
-    this.speaking,
-  );
+class ParticipantView {
+  const ParticipantView({
+    required this.name,
+    required this.initials,
+    required this.status,
+    required this.color,
+    this.speaking = false,
+    this.level = 0,
+    this.isSelf = false,
+  });
 
   final String name;
   final String initials;
   final String status;
   final Color color;
   final bool speaking;
+  final double level;
+  final bool isSelf;
+}
+
+class AudioDevice {
+  const AudioDevice({
+    required this.id,
+    required this.label,
+    required this.state,
+  });
+
+  final String id;
+  final String label;
+  final String state;
+
+  String get summary => '$label (${state.toLowerCase()})';
+}
+
+class AudioSnapshot {
+  const AudioSnapshot({
+    required this.inputs,
+    required this.outputs,
+    required this.defaultInputId,
+    required this.defaultOutputId,
+    required this.serverReachable,
+    this.error,
+  });
+
+  factory AudioSnapshot.loading() {
+    return const AudioSnapshot(
+      inputs: [],
+      outputs: [],
+      defaultInputId: null,
+      defaultOutputId: null,
+      serverReachable: false,
+    );
+  }
+
+  factory AudioSnapshot.unavailable({required String error}) {
+    return AudioSnapshot(
+      inputs: const [],
+      outputs: const [],
+      defaultInputId: null,
+      defaultOutputId: null,
+      serverReachable: false,
+      error: error,
+    );
+  }
+
+  final List<AudioDevice> inputs;
+  final List<AudioDevice> outputs;
+  final String? defaultInputId;
+  final String? defaultOutputId;
+  final bool serverReachable;
+  final String? error;
+
+  AudioSnapshot copyWith({
+    List<AudioDevice>? inputs,
+    List<AudioDevice>? outputs,
+    String? defaultInputId,
+    String? defaultOutputId,
+    bool? serverReachable,
+    String? error,
+  }) {
+    return AudioSnapshot(
+      inputs: inputs ?? this.inputs,
+      outputs: outputs ?? this.outputs,
+      defaultInputId: defaultInputId ?? this.defaultInputId,
+      defaultOutputId: defaultOutputId ?? this.defaultOutputId,
+      serverReachable: serverReachable ?? this.serverReachable,
+      error: error,
+    );
+  }
+}
+
+class AudioDefaults {
+  const AudioDefaults({
+    required this.defaultSinkId,
+    required this.defaultSourceId,
+  });
+
+  final String? defaultSinkId;
+  final String? defaultSourceId;
+}
+
+class AudioServiceException implements Exception {
+  const AudioServiceException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }
 
 class ChatMessage {
@@ -1516,6 +2586,12 @@ String sanitizeObsidianMarkdown(String markdown) {
   );
 
   return withoutWikiLinks;
+}
+
+extension on String {
+  String ifEmpty(String fallback) {
+    return trim().isEmpty ? fallback : this;
+  }
 }
 
 final Uint8List _demoImageBytes = Uint8List.fromList(<int>[

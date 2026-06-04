@@ -17,10 +17,14 @@ apt-get install -y \
   curl \
   file \
   git \
+  libasound2-dev \
   libglu1-mesa \
   libgtk-3-dev \
+  libpulse-dev \
+  libwebrtc-audio-processing-dev \
   ninja-build \
   openjdk-17-jdk \
+  portaudio19-dev \
   pkg-config \
   postgresql-client \
   unzip \
