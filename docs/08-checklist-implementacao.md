@@ -67,8 +67,8 @@ Legenda:
 
 ### RPG
 
-- `[ ]` Rolagem de dados funcional
-- `[ ]` Historico de rolagens
+- `[x]` Rolagem de dados funcional
+- `[x]` Historico de rolagens
 
 ### Personalizacao
 

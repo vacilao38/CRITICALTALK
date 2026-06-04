@@ -24,6 +24,13 @@ Esta versao implementa o layout base da sala:
 - painel de dados;
 - resumo de perfil.
 
+O painel de dados agora ja funciona com:
+
+- expressoes como `d20`, `1d20`, `2d6+3` e `4d6kh3`;
+- atalhos rapidos para dados comuns;
+- registro de historico de rolagens na propria sessao;
+- envio do resultado para o chat local.
+
 O chat ja permite enviar mensagens locais pelo campo principal ou pela tecla Enter. O Bot Teste responde automaticamente com `mensagem recebida`, permitindo validar uma conversa basica sem backend.
 
 O chat agora tambem suporta:

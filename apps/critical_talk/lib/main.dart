@@ -24,11 +24,13 @@ class CriticalTalkApp extends StatefulWidget {
     this.imagePicker = pickChatImage,
     this.audioService = const LinuxAudioControlService(),
     this.userAuthService = const _DefaultUserAuthServiceBridge(),
+    this.diceRoller = const RandomDiceRoller(),
   });
 
   final ChatImagePicker imagePicker;
   final AudioControlService audioService;
   final UserAuthService userAuthService;
+  final DiceRoller diceRoller;
 
   @override
   State<CriticalTalkApp> createState() => _CriticalTalkAppState();
@@ -107,6 +109,7 @@ class _CriticalTalkAppState extends State<CriticalTalkApp> {
           return SessionShell(
             imagePicker: widget.imagePicker,
             audioService: widget.audioService,
+            diceRoller: widget.diceRoller,
             currentUser: currentUser,
             authService: widget.userAuthService,
             onProfileUpdated: _setAuthenticatedUser,
@@ -163,6 +166,85 @@ class _DefaultUserAuthServiceBridge extends UserAuthService {
       banner: banner,
       bannerAlignmentY: bannerAlignmentY,
     );
+  }
+}
+
+abstract class DiceRoller {
+  const DiceRoller();
+
+  DiceRollRecord roll(String expression, {required String author});
+}
+
+class RandomDiceRoller extends DiceRoller {
+  const RandomDiceRoller();
+
+  @override
+  DiceRollRecord roll(String expression, {required String author}) {
+    final request = parseDiceExpression(expression);
+    final random = math.Random.secure();
+    final rolls = List<int>.generate(
+      request.diceCount,
+      (_) => random.nextInt(request.sides) + 1,
+    );
+
+    final keptIndexes = _selectKeptIndexes(
+      rolls: rolls,
+      selectionMode: request.selectionMode,
+      selectionCount: request.selectionCount,
+    );
+    final keptRolls = [
+      for (var index = 0; index < rolls.length; index++)
+        if (keptIndexes.contains(index)) rolls[index],
+    ];
+    final total =
+        keptRolls.fold<int>(0, (sum, value) => sum + value) + request.modifier;
+
+    return DiceRollRecord(
+      author: author,
+      expression: expression.trim(),
+      normalizedExpression: request.normalizedExpression,
+      total: total,
+      modifier: request.modifier,
+      rolls: rolls,
+      keptRolls: keptRolls,
+      selectionLabel: request.selectionLabel,
+      rolledAt: DateTime.now(),
+    );
+  }
+
+  Set<int> _selectKeptIndexes({
+    required List<int> rolls,
+    required DiceSelectionMode selectionMode,
+    required int? selectionCount,
+  }) {
+    final indexes = List<int>.generate(rolls.length, (index) => index);
+
+    if (selectionMode == DiceSelectionMode.none || selectionCount == null) {
+      return indexes.toSet();
+    }
+
+    final safeCount = selectionCount.clamp(0, rolls.length);
+    final sorted = [...indexes]
+      ..sort((left, right) {
+        final valueComparison = rolls[left].compareTo(rolls[right]);
+        if (valueComparison != 0) {
+          return valueComparison;
+        }
+        return left.compareTo(right);
+      });
+
+    switch (selectionMode) {
+      case DiceSelectionMode.keepHighest:
+        return sorted.reversed.take(safeCount).toSet();
+      case DiceSelectionMode.keepLowest:
+        return sorted.take(safeCount).toSet();
+      case DiceSelectionMode.dropHighest:
+        return sorted.reversed.skip(safeCount).toSet();
+      case DiceSelectionMode.dropLowest:
+        return sorted.skip(safeCount).toSet();
+      case DiceSelectionMode.none:
+        return indexes.toSet();
+    }
   }
 }
 
@@ -1209,6 +1291,7 @@ class SessionShell extends StatefulWidget {
   const SessionShell({
     required this.imagePicker,
     required this.audioService,
+    required this.diceRoller,
     required this.currentUser,
     required this.authService,
     required this.onProfileUpdated,
@@ -1218,6 +1301,7 @@ class SessionShell extends StatefulWidget {
 
   final ChatImagePicker imagePicker;
   final AudioControlService audioService;
+  final DiceRoller diceRoller;
   final CriticalUser currentUser;
   final UserAuthService authService;
   final ValueChanged<CriticalUser> onProfileUpdated;
@@ -1242,6 +1326,19 @@ class _SessionShellState extends State<SessionShell> {
       imageBytes: _demoImageBytes,
     ),
   ].toList();
+  late final List<DiceRollRecord> _diceHistory = [
+    DiceRollRecord(
+      author: 'Darian',
+      expression: '1d20+4',
+      normalizedExpression: '1d20+4',
+      total: 17,
+      modifier: 4,
+      rolls: const [13],
+      keptRolls: const [13],
+      selectionLabel: null,
+      rolledAt: DateTime.now().subtract(const Duration(minutes: 4)),
+    ),
+  ];
 
   AudioSnapshot _audioSnapshot = AudioSnapshot.loading();
   bool _isPickingImage = false;
@@ -1504,6 +1601,32 @@ class _SessionShellState extends State<SessionShell> {
     }
   }
 
+  DiceRollRecord _submitDiceRoll(String expression) {
+    final record = widget.diceRoller.roll(
+      expression,
+      author: widget.currentUser.userName,
+    );
+
+    setState(() {
+      _diceHistory.insert(0, record);
+      _messages.add(
+        ChatMessage.text(
+          widget.currentUser.userName,
+          record.chatMessage,
+          self: true,
+        ),
+      );
+    });
+
+    return record;
+  }
+
+  void _clearDiceHistory() {
+    setState(() {
+      _diceHistory.clear();
+    });
+  }
+
   Future<void> _openProfileEditor() async {
     final draft = await showDialog<ProfileEditorDraft>(
       context: context,
@@ -1586,6 +1709,9 @@ class _SessionShellState extends State<SessionShell> {
                               onToggleMute: _toggleMute,
                               currentUser: widget.currentUser,
                               onEditProfile: _openProfileEditor,
+                              diceHistory: _diceHistory,
+                              onDiceSubmitted: _submitDiceRoll,
+                              onClearDiceHistory: _clearDiceHistory,
                             );
                           }
 
@@ -1608,6 +1734,9 @@ class _SessionShellState extends State<SessionShell> {
                             onToggleMute: _toggleMute,
                             currentUser: widget.currentUser,
                             onEditProfile: _openProfileEditor,
+                            diceHistory: _diceHistory,
+                            onDiceSubmitted: _submitDiceRoll,
+                            onClearDiceHistory: _clearDiceHistory,
                           );
                         },
                       ),
@@ -1643,6 +1772,9 @@ class WideSessionLayout extends StatelessWidget {
     required this.onToggleMute,
     required this.currentUser,
     required this.onEditProfile,
+    required this.diceHistory,
+    required this.onDiceSubmitted,
+    required this.onClearDiceHistory,
     super.key,
   });
 
@@ -1664,6 +1796,9 @@ class WideSessionLayout extends StatelessWidget {
   final VoidCallback onToggleMute;
   final CriticalUser currentUser;
   final Future<void> Function() onEditProfile;
+  final List<DiceRollRecord> diceHistory;
+  final DiceRollRecord Function(String expression) onDiceSubmitted;
+  final VoidCallback onClearDiceHistory;
 
   @override
   Widget build(BuildContext context) {
@@ -1703,6 +1838,9 @@ class WideSessionLayout extends StatelessWidget {
           child: SideToolsPanel(
             currentUser: currentUser,
             onEditProfile: onEditProfile,
+            diceHistory: diceHistory,
+            onDiceSubmitted: onDiceSubmitted,
+            onClearDiceHistory: onClearDiceHistory,
           ),
         ),
       ],
@@ -1730,6 +1868,9 @@ class CompactSessionLayout extends StatelessWidget {
     required this.onToggleMute,
     required this.currentUser,
     required this.onEditProfile,
+    required this.diceHistory,
+    required this.onDiceSubmitted,
+    required this.onClearDiceHistory,
     super.key,
   });
 
@@ -1751,6 +1892,9 @@ class CompactSessionLayout extends StatelessWidget {
   final VoidCallback onToggleMute;
   final CriticalUser currentUser;
   final Future<void> Function() onEditProfile;
+  final List<DiceRollRecord> diceHistory;
+  final DiceRollRecord Function(String expression) onDiceSubmitted;
+  final VoidCallback onClearDiceHistory;
 
   @override
   Widget build(BuildContext context) {
@@ -1792,6 +1936,9 @@ class CompactSessionLayout extends StatelessWidget {
                 child: SideToolsPanel(
                   currentUser: currentUser,
                   onEditProfile: onEditProfile,
+                  diceHistory: diceHistory,
+                  onDiceSubmitted: onDiceSubmitted,
+                  onClearDiceHistory: onClearDiceHistory,
                 ),
               ),
             ],
@@ -2945,11 +3092,17 @@ class SideToolsPanel extends StatelessWidget {
   const SideToolsPanel({
     required this.currentUser,
     required this.onEditProfile,
+    required this.diceHistory,
+    required this.onDiceSubmitted,
+    required this.onClearDiceHistory,
     super.key,
   });
 
   final CriticalUser currentUser;
   final Future<void> Function() onEditProfile;
+  final List<DiceRollRecord> diceHistory;
+  final DiceRollRecord Function(String expression) onDiceSubmitted;
+  final VoidCallback onClearDiceHistory;
 
   @override
   Widget build(BuildContext context) {
@@ -2957,7 +3110,14 @@ class SideToolsPanel extends StatelessWidget {
       children: [
         const Expanded(flex: 3, child: MusicPanel()),
         const SizedBox(height: 12),
-        const Expanded(flex: 2, child: DicePanel()),
+        Expanded(
+          flex: 2,
+          child: DicePanel(
+            history: diceHistory,
+            onSubmitted: onDiceSubmitted,
+            onClearHistory: onClearDiceHistory,
+          ),
+        ),
         const SizedBox(height: 12),
         SizedBox(
           height: 164,
@@ -3076,75 +3236,268 @@ class TrackTile extends StatelessWidget {
 }
 
 class DicePanel extends StatelessWidget {
-  const DicePanel({super.key});
+  const DicePanel({
+    required this.history,
+    required this.onSubmitted,
+    required this.onClearHistory,
+    super.key,
+  });
+
+  final List<DiceRollRecord> history;
+  final DiceRollRecord Function(String expression) onSubmitted;
+  final VoidCallback onClearHistory;
 
   @override
   Widget build(BuildContext context) {
     return Panel(
       title: 'Dados',
-      trailing: IconToolButton(icon: Icons.visibility_off, label: 'Ocultar'),
-      child: SingleChildScrollView(
-        child: Column(
-          children: [
-            Row(
-              children: const [
-                DiceChip(label: 'd4'),
-                DiceChip(label: 'd6'),
-                DiceChip(label: 'd8'),
-                DiceChip(label: 'd20'),
-              ],
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              decoration: InputDecoration(
-                hintText: '1d20+5',
-                filled: true,
-                fillColor: const Color(0xFF151719),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: BorderSide.none,
+      trailing: IconToolButton(
+        icon: Icons.delete_sweep,
+        label: 'Limpar historico',
+        onPressed: history.isEmpty ? null : onClearHistory,
+      ),
+      child: DicePanelBody(history: history, onSubmitted: onSubmitted),
+    );
+  }
+}
+
+class DicePanelBody extends StatefulWidget {
+  const DicePanelBody({
+    required this.history,
+    required this.onSubmitted,
+    super.key,
+  });
+
+  final List<DiceRollRecord> history;
+  final DiceRollRecord Function(String expression) onSubmitted;
+
+  @override
+  State<DicePanelBody> createState() => _DicePanelBodyState();
+}
+
+class _DicePanelBodyState extends State<DicePanelBody> {
+  late final TextEditingController _controller;
+  String? _error;
+
+  static const _shortcuts = ['d4', 'd6', 'd8', 'd20', '2d6+3', '4d6kh3'];
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit([String? shortcut]) {
+    final expression = (shortcut ?? _controller.text).trim();
+    if (expression.isEmpty) {
+      return;
+    }
+
+    try {
+      widget.onSubmitted(expression);
+      setState(() {
+        _error = null;
+      });
+      if (shortcut == null) {
+        _controller.clear();
+      }
+    } on DiceRollException catch (error) {
+      setState(() {
+        _error = error.message;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final latest = widget.history.isNotEmpty ? widget.history.first : null;
+
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: _shortcuts
+                .map(
+                  (shortcut) => DiceChip(
+                    label: shortcut,
+                    onPressed: () {
+                      _controller.text = shortcut;
+                      _submit(shortcut);
+                    },
+                  ),
+                )
+                .toList(),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _controller,
+                  onSubmitted: (_) => _submit(),
+                  decoration: InputDecoration(
+                    hintText: '1d20+5',
+                    filled: true,
+                    fillColor: const Color(0xFF151719),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
                 ),
               ),
-            ),
+              const SizedBox(width: 8),
+              SizedBox(
+                height: 48,
+                child: FilledButton.icon(
+                  onPressed: () => _submit(),
+                  icon: const Icon(Icons.casino),
+                  label: const Text('Rolar'),
+                  style: FilledButton.styleFrom(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_error != null) ...[
             const SizedBox(height: 10),
+            ErrorStrip(message: _error!),
+          ],
+          if (latest != null) ...[
+            const SizedBox(height: 10),
+            DiceResultCard(record: latest, highlight: true),
+          ],
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              const Text(
+                'Historico',
+                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12),
+              ),
+              const Spacer(),
+              CounterBadge(text: '${widget.history.length} rolagens'),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (widget.history.isEmpty)
             Container(
-              height: 56,
+              height: 72,
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: const Color(0xFF1A1D20),
                 borderRadius: BorderRadius.circular(8),
               ),
               child: const Text(
-                'Darian rolou 17',
-                style: TextStyle(fontWeight: FontWeight.w800),
+                'Sem rolagens ainda',
+                style: TextStyle(color: Color(0xFFAEB8B5)),
               ),
+            )
+          else
+            Column(
+              children: [
+                for (var index = 0; index < widget.history.length; index++) ...[
+                  DiceResultCard(record: widget.history[index]),
+                  if (index != widget.history.length - 1)
+                    const SizedBox(height: 8),
+                ],
+              ],
             ),
-          ],
-        ),
+        ],
       ),
     );
   }
 }
 
 class DiceChip extends StatelessWidget {
-  const DiceChip({required this.label, super.key});
+  const DiceChip({required this.label, required this.onPressed, super.key});
 
   final String label;
+  final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
-    return Expanded(
-      child: Container(
-        height: 34,
-        margin: const EdgeInsets.only(right: 6),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: const Color(0xFF223D38),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0xFF356F62)),
+    return SizedBox(
+      width: 62,
+      height: 34,
+      child: OutlinedButton(
+        onPressed: onPressed,
+        style: OutlinedButton.styleFrom(
+          padding: EdgeInsets.zero,
+          backgroundColor: const Color(0xFF223D38),
+          foregroundColor: Colors.white,
+          side: const BorderSide(color: Color(0xFF356F62)),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
         ),
         child: Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
+      ),
+    );
+  }
+}
+
+class DiceResultCard extends StatelessWidget {
+  const DiceResultCard({
+    required this.record,
+    this.highlight = false,
+    super.key,
+  });
+
+  final DiceRollRecord record;
+  final bool highlight;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: highlight ? const Color(0xFF223D38) : const Color(0xFF1A1D20),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: highlight ? const Color(0xFF356F62) : const Color(0xFF2A2F33),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${record.author} rolou ${record.total}',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w800),
+                ),
+              ),
+              Text(
+                record.timestampLabel,
+                style: const TextStyle(color: Color(0xFFAEB8B5), fontSize: 11),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            record.summaryLabel,
+            style: const TextStyle(color: Color(0xFFBFE9DD), fontSize: 12),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            record.breakdownLabel,
+            style: const TextStyle(color: Color(0xFFAEB8B5), fontSize: 12),
+          ),
+        ],
       ),
     );
   }
@@ -3835,6 +4188,174 @@ class AudioServiceException implements Exception {
 
   @override
   String toString() => message;
+}
+
+enum DiceSelectionMode {
+  none,
+  keepHighest,
+  keepLowest,
+  dropHighest,
+  dropLowest,
+}
+
+class DiceRollRequest {
+  const DiceRollRequest({
+    required this.diceCount,
+    required this.sides,
+    required this.selectionMode,
+    required this.selectionCount,
+    required this.modifier,
+    required this.normalizedExpression,
+  });
+
+  final int diceCount;
+  final int sides;
+  final DiceSelectionMode selectionMode;
+  final int? selectionCount;
+  final int modifier;
+  final String normalizedExpression;
+
+  String? get selectionLabel {
+    if (selectionMode == DiceSelectionMode.none || selectionCount == null) {
+      return null;
+    }
+
+    final prefix = switch (selectionMode) {
+      DiceSelectionMode.keepHighest => 'kh',
+      DiceSelectionMode.keepLowest => 'kl',
+      DiceSelectionMode.dropHighest => 'dh',
+      DiceSelectionMode.dropLowest => 'dl',
+      DiceSelectionMode.none => '',
+    };
+    return '$prefix$selectionCount';
+  }
+}
+
+class DiceRollRecord {
+  const DiceRollRecord({
+    required this.author,
+    required this.expression,
+    required this.normalizedExpression,
+    required this.total,
+    required this.modifier,
+    required this.rolls,
+    required this.keptRolls,
+    required this.selectionLabel,
+    required this.rolledAt,
+  });
+
+  final String author;
+  final String expression;
+  final String normalizedExpression;
+  final int total;
+  final int modifier;
+  final List<int> rolls;
+  final List<int> keptRolls;
+  final String? selectionLabel;
+  final DateTime rolledAt;
+
+  String get summaryLabel => '$normalizedExpression = $total';
+
+  String get breakdownLabel {
+    final buffer = StringBuffer('rolagens ${_formatList(rolls)}');
+    if (selectionLabel != null) {
+      buffer.write(' $selectionLabel -> ${_formatList(keptRolls)}');
+    }
+    if (modifier != 0) {
+      buffer.write(modifier > 0 ? ' +$modifier' : ' $modifier');
+    }
+    return buffer.toString();
+  }
+
+  String get chatMessage =>
+      '**$normalizedExpression = $total**\n$breakdownLabel';
+
+  String get timestampLabel {
+    final hour = rolledAt.hour.toString().padLeft(2, '0');
+    final minute = rolledAt.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
+  String _formatList(List<int> values) {
+    return '[${values.join(', ')}]';
+  }
+}
+
+class DiceRollException implements Exception {
+  const DiceRollException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+DiceRollRequest parseDiceExpression(String input) {
+  final trimmed = input.trim().toLowerCase().replaceAll(' ', '');
+  final match = RegExp(
+    r'^(\d*)d(\d+)(?:(k[hl]|d[hl])(\d+))?([+-]\d+)?$',
+  ).firstMatch(trimmed);
+
+  if (match == null) {
+    throw const DiceRollException(
+      'Use formatos como d20, 1d20, 2d6+3 ou 4d6kh3.',
+    );
+  }
+
+  final diceCount = int.tryParse((match.group(1) ?? '').ifEmpty('1')) ?? 1;
+  final sides = int.tryParse(match.group(2) ?? '') ?? 0;
+  final selectionToken = match.group(3);
+  final selectionCount = match.group(4) == null
+      ? null
+      : int.tryParse(match.group(4)!);
+  final modifier = int.tryParse(match.group(5) ?? '0') ?? 0;
+
+  if (diceCount < 1 || diceCount > 50) {
+    throw const DiceRollException(
+      'A quantidade de dados deve ficar entre 1 e 50.',
+    );
+  }
+  if (sides < 2 || sides > 1000) {
+    throw const DiceRollException(
+      'O numero de faces deve ficar entre 2 e 1000.',
+    );
+  }
+  if (selectionCount != null &&
+      (selectionCount < 1 || selectionCount > diceCount)) {
+    throw const DiceRollException(
+      'O valor de keep/drop precisa ser pelo menos 1 e no maximo a quantidade de dados.',
+    );
+  }
+  if (modifier.abs() > 1000) {
+    throw const DiceRollException(
+      'O modificador precisa ficar entre -1000 e 1000.',
+    );
+  }
+
+  final selectionMode = switch (selectionToken) {
+    'kh' => DiceSelectionMode.keepHighest,
+    'kl' => DiceSelectionMode.keepLowest,
+    'dh' => DiceSelectionMode.dropHighest,
+    'dl' => DiceSelectionMode.dropLowest,
+    _ => DiceSelectionMode.none,
+  };
+
+  final normalizedBuffer = StringBuffer('${diceCount}d$sides');
+  if (selectionToken != null && selectionCount != null) {
+    normalizedBuffer.write('$selectionToken$selectionCount');
+  }
+  if (modifier != 0) {
+    normalizedBuffer.write(modifier > 0 ? '+$modifier' : '$modifier');
+  }
+
+  return DiceRollRequest(
+    diceCount: diceCount,
+    sides: sides,
+    selectionMode: selectionMode,
+    selectionCount: selectionCount,
+    modifier: modifier,
+    normalizedExpression: normalizedBuffer.toString(),
+  );
 }
 
 class ChatMessage {

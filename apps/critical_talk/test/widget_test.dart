@@ -18,6 +18,17 @@ void main() {
     );
   });
 
+  test('parses complex dice expressions with keep highest and modifier', () {
+    final request = parseDiceExpression('4d6kh3+2');
+
+    expect(request.diceCount, 4);
+    expect(request.sides, 6);
+    expect(request.selectionMode, DiceSelectionMode.keepHighest);
+    expect(request.selectionCount, 3);
+    expect(request.modifier, 2);
+    expect(request.normalizedExpression, '4d6kh3+2');
+  });
+
   testWidgets('renders the base session layout', (WidgetTester tester) async {
     await tester.binding.setSurfaceSize(const Size(1366, 768));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -273,17 +284,41 @@ void main() {
 
     expect(find.text('mensagem recebida'), findsOneWidget);
   });
+
+  testWidgets(
+    'rolls dice functionally and appends the result to history and chat',
+    (WidgetTester tester) async {
+      final diceRoller = FakeDiceRoller();
+
+      await tester.binding.setSurfaceSize(const Size(1366, 768));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(_buildApp(diceRoller: diceRoller));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.widgetWithText(TextField, '1d20+5'), '2d6+3');
+      await tester.tap(find.widgetWithText(FilledButton, 'Rolar'));
+      await tester.pump();
+
+      expect(find.text('Rogerin rolou 11'), findsWidgets);
+      expect(find.text('2d6+3 = 11'), findsWidgets);
+      expect(find.textContaining('rolagens [4, 4] +3'), findsWidgets);
+      expect(diceRoller.rollCount, 1);
+    },
+  );
 }
 
 Widget _buildApp({
   ChatImagePicker imagePicker = _defaultImagePicker,
   AudioControlService? audioService,
   UserAuthService? authService,
+  DiceRoller? diceRoller,
 }) {
   return CriticalTalkApp(
     imagePicker: imagePicker,
     audioService: audioService ?? FakeAudioControlService(),
     userAuthService: authService ?? FakeUserAuthService(),
+    diceRoller: diceRoller ?? const RandomDiceRoller(),
   );
 }
 
@@ -473,6 +508,26 @@ class FakeUserAuthService extends UserAuthService {
         _passwords.remove(current.userName.toLowerCase()) ?? 'Senha@123';
     _currentUser = updated;
     return updated;
+  }
+}
+
+class FakeDiceRoller extends DiceRoller {
+  int rollCount = 0;
+
+  @override
+  DiceRollRecord roll(String expression, {required String author}) {
+    rollCount++;
+    return DiceRollRecord(
+      author: author,
+      expression: expression,
+      normalizedExpression: '2d6+3',
+      total: 11,
+      modifier: 3,
+      rolls: const [4, 4],
+      keptRolls: const [4, 4],
+      selectionLabel: null,
+      rolledAt: DateTime(2026, 6, 4, 21, 30),
+    );
   }
 }
 
