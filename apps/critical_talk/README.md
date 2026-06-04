@@ -16,7 +16,16 @@ Esta versao implementa o layout base da sala:
 - painel de dados;
 - resumo de perfil.
 
-Os dados exibidos ainda sao mockados. Voz, chat em tempo real, trilhas reais, envio de imagem e rolagem funcional entram nas proximas fatias.
+O chat ja permite enviar mensagens locais pelo campo principal ou pela tecla Enter. O Bot Teste responde automaticamente com `mensagem recebida`, permitindo validar uma conversa basica sem backend.
+
+O chat agora tambem suporta:
+
+- renderizacao de markdown no estilo Obsidian para enfase, listas, blocos e codigo;
+- neutralizacao de links markdown e wikilinks, exibindo apenas o texto visivel;
+- envio local de imagens por seletor de arquivo no Linux;
+- preview da imagem dentro da conversa.
+
+Voz, chat em tempo real, trilhas reais e upload remoto entram nas proximas fatias.
 
 ## Rodar em desenvolvimento
 
