@@ -58,12 +58,12 @@ Legenda:
 
 ### Trilhas sonoras
 
-- `[ ]` Cadastro de trilhas
-- `[ ]` Preview de trilha
-- `[ ]` Play
-- `[ ]` Pause
-- `[ ]` Stop
-- `[ ]` Loop simples
+- `[x]` Cadastro de trilhas locais
+- `[x]` Preview de trilha
+- `[x]` Play
+- `[x]` Pause
+- `[x]` Stop
+- `[x]` Loop simples
 
 ### RPG
 

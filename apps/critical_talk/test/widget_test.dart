@@ -285,6 +285,57 @@ void main() {
     expect(find.text('mensagem recebida'), findsOneWidget);
   });
 
+  testWidgets('adds a local soundtrack and controls preview, play, pause, stop and loop', (
+    WidgetTester tester,
+  ) async {
+    final musicService = FakeMusicPlaybackService();
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _buildApp(
+        trackPicker: () async => const SelectedAudioTrack(
+          name: 'campfire.mp3',
+          path: '/tmp/campfire.mp3',
+        ),
+        musicPlaybackService: musicService,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Adicionar trilha'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('campfire.mp3'), findsOneWidget);
+
+    await tester.tap(find.byTooltip('Preview'));
+    await tester.pumpAndSettle();
+    expect(musicService.previewCount, 1);
+    expect(find.text('Preview privado'), findsWidgets);
+
+    await tester.tap(find.byTooltip('Tocar na sala'));
+    await tester.pumpAndSettle();
+    expect(musicService.playCount, 1);
+    expect(find.text('Ao vivo na sala'), findsWidgets);
+
+    await tester.tap(find.byTooltip('Pausar'));
+    await tester.pumpAndSettle();
+    expect(musicService.pauseCount, 1);
+
+    await tester.tap(find.byTooltip('Retomar'));
+    await tester.pumpAndSettle();
+    expect(musicService.resumeCount, 1);
+
+    await tester.tap(find.byTooltip('Loop simples'));
+    await tester.pumpAndSettle();
+    expect(musicService.loopToggleCount, 1);
+
+    await tester.tap(find.byTooltip('Parar'));
+    await tester.pumpAndSettle();
+    expect(musicService.stopCount, 1);
+  });
+
   testWidgets(
     'rolls dice functionally and appends the result to history and chat',
     (WidgetTester tester) async {
@@ -310,19 +361,24 @@ void main() {
 
 Widget _buildApp({
   ChatImagePicker imagePicker = _defaultImagePicker,
+  AudioTrackPicker trackPicker = _defaultTrackPicker,
   AudioControlService? audioService,
   UserAuthService? authService,
   DiceRoller? diceRoller,
+  MusicPlaybackService? musicPlaybackService,
 }) {
   return CriticalTalkApp(
     imagePicker: imagePicker,
+    trackPicker: trackPicker,
     audioService: audioService ?? FakeAudioControlService(),
+    musicPlaybackService: musicPlaybackService ?? FakeMusicPlaybackService(),
     userAuthService: authService ?? FakeUserAuthService(),
     diceRoller: diceRoller ?? const RandomDiceRoller(),
   );
 }
 
 Future<SelectedChatImage?> _defaultImagePicker() async => null;
+Future<SelectedAudioTrack?> _defaultTrackPicker() async => null;
 
 class FakeAudioControlService extends AudioControlService {
   FakeAudioControlService({
@@ -528,6 +584,98 @@ class FakeDiceRoller extends DiceRoller {
       selectionLabel: null,
       rolledAt: DateTime(2026, 6, 4, 21, 30),
     );
+  }
+}
+
+class FakeMusicPlaybackService extends MusicPlaybackService {
+  final StreamController<SoundtrackPlaybackSnapshot> _controller =
+      StreamController<SoundtrackPlaybackSnapshot>.broadcast();
+  SoundtrackPlaybackSnapshot _snapshot = SoundtrackPlaybackSnapshot.idle();
+
+  int previewCount = 0;
+  int playCount = 0;
+  int pauseCount = 0;
+  int resumeCount = 0;
+  int stopCount = 0;
+  int loopToggleCount = 0;
+
+  @override
+  Stream<SoundtrackPlaybackSnapshot> get changes => _controller.stream;
+
+  @override
+  SoundtrackPlaybackSnapshot get snapshot => _snapshot;
+
+  @override
+  Future<void> dispose() async {
+    await _controller.close();
+  }
+
+  @override
+  Future<void> pause() async {
+    pauseCount++;
+    _emit(_snapshot.copyWith(isPlaying: false, isPaused: true));
+  }
+
+  @override
+  Future<void> playTrack(LocalSoundtrackTrack track) async {
+    playCount++;
+    _emit(
+      _snapshot.copyWith(
+        activeTrackId: track.id,
+        scope: SoundtrackPlaybackScope.room,
+        isPlaying: true,
+        isPaused: false,
+        duration: const Duration(minutes: 3, seconds: 12),
+        position: const Duration(minutes: 1, seconds: 14),
+      ),
+    );
+  }
+
+  @override
+  Future<void> previewTrack(LocalSoundtrackTrack track) async {
+    previewCount++;
+    _emit(
+      _snapshot.copyWith(
+        activeTrackId: track.id,
+        scope: SoundtrackPlaybackScope.preview,
+        isPlaying: true,
+        isPaused: false,
+        duration: const Duration(minutes: 3, seconds: 12),
+        position: const Duration(seconds: 24),
+      ),
+    );
+  }
+
+  @override
+  Future<void> resume() async {
+    resumeCount++;
+    _emit(_snapshot.copyWith(isPlaying: true, isPaused: false));
+  }
+
+  @override
+  Future<void> setLoopEnabled(bool enabled) async {
+    loopToggleCount++;
+    _emit(_snapshot.copyWith(isLoopEnabled: enabled));
+  }
+
+  @override
+  Future<void> stop() async {
+    stopCount++;
+    _emit(
+      _snapshot.copyWith(
+        isPlaying: false,
+        isPaused: false,
+        position: Duration.zero,
+        scope: SoundtrackPlaybackScope.idle,
+      ),
+    );
+  }
+
+  void _emit(SoundtrackPlaybackSnapshot snapshot) {
+    _snapshot = snapshot;
+    if (!_controller.isClosed) {
+      _controller.add(snapshot);
+    }
   }
 }
 

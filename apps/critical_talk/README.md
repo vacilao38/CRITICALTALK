@@ -50,6 +50,15 @@ O painel de voz agora tambem suporta:
 - retorno local da propria voz para testar captacao e clareza;
 - bot de teste emitindo audio no sistema para validar a saida selecionada.
 
+O painel de trilha agora funciona sem Spotify e sem chaves externas:
+
+- cadastro de arquivos locais de audio;
+- preview privado;
+- tocar na sala;
+- pausar;
+- parar;
+- loop simples.
+
 Voz em tempo real entre participantes continua como a prioridade tecnica seguinte, mas a validacao completa ficou pendente de teste com um segundo usuario conectado.
 
 Chat em tempo real, captura/publicacao de voz e trilhas reais entram nas proximas fatias.

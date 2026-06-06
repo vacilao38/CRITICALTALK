@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:audioplayers/audioplayers.dart' as audio_player;
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -13,6 +14,7 @@ import 'package:path/path.dart' as p;
 import 'package:critical_talk/user_foundation.dart';
 
 typedef ChatImagePicker = Future<SelectedChatImage?> Function();
+typedef AudioTrackPicker = Future<SelectedAudioTrack?> Function();
 
 void main() {
   runApp(const CriticalTalkApp());
@@ -22,13 +24,17 @@ class CriticalTalkApp extends StatefulWidget {
   const CriticalTalkApp({
     super.key,
     this.imagePicker = pickChatImage,
+    this.trackPicker = pickAudioTrack,
     this.audioService = const LinuxAudioControlService(),
+    this.musicPlaybackService = const _DefaultMusicPlaybackServiceBridge(),
     this.userAuthService = const _DefaultUserAuthServiceBridge(),
     this.diceRoller = const RandomDiceRoller(),
   });
 
   final ChatImagePicker imagePicker;
+  final AudioTrackPicker trackPicker;
   final AudioControlService audioService;
+  final MusicPlaybackService musicPlaybackService;
   final UserAuthService userAuthService;
   final DiceRoller diceRoller;
 
@@ -73,6 +79,12 @@ class _CriticalTalkAppState extends State<CriticalTalkApp> {
   }
 
   @override
+  void dispose() {
+    unawaited(widget.musicPlaybackService.dispose());
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Critical Talk',
@@ -108,7 +120,9 @@ class _CriticalTalkAppState extends State<CriticalTalkApp> {
 
           return SessionShell(
             imagePicker: widget.imagePicker,
+            trackPicker: widget.trackPicker,
             audioService: widget.audioService,
+            musicPlaybackService: widget.musicPlaybackService,
             diceRoller: widget.diceRoller,
             currentUser: currentUser,
             authService: widget.userAuthService,
@@ -167,6 +181,282 @@ class _DefaultUserAuthServiceBridge extends UserAuthService {
       bannerAlignmentY: bannerAlignmentY,
     );
   }
+}
+
+enum SoundtrackPlaybackScope { idle, preview, room }
+
+class SoundtrackPlaybackSnapshot {
+  const SoundtrackPlaybackSnapshot({
+    required this.activeTrackId,
+    required this.scope,
+    required this.isPlaying,
+    required this.isPaused,
+    required this.isLoopEnabled,
+    required this.position,
+    required this.duration,
+    this.error,
+  });
+
+  factory SoundtrackPlaybackSnapshot.idle() {
+    return const SoundtrackPlaybackSnapshot(
+      activeTrackId: null,
+      scope: SoundtrackPlaybackScope.idle,
+      isPlaying: false,
+      isPaused: false,
+      isLoopEnabled: false,
+      position: Duration.zero,
+      duration: Duration.zero,
+    );
+  }
+
+  final String? activeTrackId;
+  final SoundtrackPlaybackScope scope;
+  final bool isPlaying;
+  final bool isPaused;
+  final bool isLoopEnabled;
+  final Duration position;
+  final Duration duration;
+  final String? error;
+
+  bool get hasActiveTrack => activeTrackId != null;
+
+  double get progress {
+    if (duration.inMilliseconds <= 0) {
+      return 0;
+    }
+    return (position.inMilliseconds / duration.inMilliseconds).clamp(0.0, 1.0);
+  }
+
+  String get scopeLabel => switch (scope) {
+    SoundtrackPlaybackScope.preview => 'Preview privado',
+    SoundtrackPlaybackScope.room => 'Ao vivo na sala',
+    SoundtrackPlaybackScope.idle => 'Sem trilha ativa',
+  };
+
+  SoundtrackPlaybackSnapshot copyWith({
+    Object? activeTrackId = _soundtrackSentinel,
+    SoundtrackPlaybackScope? scope,
+    bool? isPlaying,
+    bool? isPaused,
+    bool? isLoopEnabled,
+    Duration? position,
+    Duration? duration,
+    Object? error = _soundtrackSentinel,
+  }) {
+    return SoundtrackPlaybackSnapshot(
+      activeTrackId: activeTrackId == _soundtrackSentinel
+          ? this.activeTrackId
+          : activeTrackId as String?,
+      scope: scope ?? this.scope,
+      isPlaying: isPlaying ?? this.isPlaying,
+      isPaused: isPaused ?? this.isPaused,
+      isLoopEnabled: isLoopEnabled ?? this.isLoopEnabled,
+      position: position ?? this.position,
+      duration: duration ?? this.duration,
+      error: error == _soundtrackSentinel ? this.error : error as String?,
+    );
+  }
+}
+
+abstract class MusicPlaybackService {
+  const MusicPlaybackService();
+
+  SoundtrackPlaybackSnapshot get snapshot;
+
+  Stream<SoundtrackPlaybackSnapshot> get changes;
+
+  Future<void> previewTrack(LocalSoundtrackTrack track);
+
+  Future<void> playTrack(LocalSoundtrackTrack track);
+
+  Future<void> pause();
+
+  Future<void> resume();
+
+  Future<void> stop();
+
+  Future<void> setLoopEnabled(bool enabled);
+
+  Future<void> dispose();
+}
+
+class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
+  AudioPlayersMusicPlaybackService() {
+    _player.onPlayerStateChanged.listen(_handlePlayerState);
+    _player.onDurationChanged.listen((duration) {
+      _emit(_snapshot.copyWith(duration: duration));
+    });
+    _player.onPositionChanged.listen((position) {
+      _emit(_snapshot.copyWith(position: position));
+    });
+    _player.onPlayerComplete.listen((_) {
+      if (_snapshot.isLoopEnabled) {
+        return;
+      }
+      _emit(
+        _snapshot.copyWith(
+          isPlaying: false,
+          isPaused: false,
+          position: Duration.zero,
+          scope: SoundtrackPlaybackScope.idle,
+        ),
+      );
+    });
+  }
+
+  final audio_player.AudioPlayer _player = audio_player.AudioPlayer();
+  final StreamController<SoundtrackPlaybackSnapshot> _controller =
+      StreamController<SoundtrackPlaybackSnapshot>.broadcast();
+  SoundtrackPlaybackSnapshot _snapshot = SoundtrackPlaybackSnapshot.idle();
+
+  @override
+  SoundtrackPlaybackSnapshot get snapshot => _snapshot;
+
+  @override
+  Stream<SoundtrackPlaybackSnapshot> get changes => _controller.stream;
+
+  @override
+  Future<void> previewTrack(LocalSoundtrackTrack track) async {
+    await _startTrack(track, scope: SoundtrackPlaybackScope.preview);
+  }
+
+  @override
+  Future<void> playTrack(LocalSoundtrackTrack track) async {
+    await _startTrack(track, scope: SoundtrackPlaybackScope.room);
+  }
+
+  Future<void> _startTrack(
+    LocalSoundtrackTrack track, {
+    required SoundtrackPlaybackScope scope,
+  }) async {
+    try {
+      await _player.setReleaseMode(
+        _snapshot.isLoopEnabled
+            ? audio_player.ReleaseMode.loop
+            : audio_player.ReleaseMode.stop,
+      );
+      await _player.play(audio_player.DeviceFileSource(track.path));
+      _emit(
+        _snapshot.copyWith(
+          activeTrackId: track.id,
+          scope: scope,
+          isPlaying: true,
+          isPaused: false,
+          position: Duration.zero,
+          error: null,
+        ),
+      );
+    } catch (error) {
+      _emit(_snapshot.copyWith(error: error.toString()));
+    }
+  }
+
+  @override
+  Future<void> pause() async {
+    await _player.pause();
+    _emit(_snapshot.copyWith(isPlaying: false, isPaused: true));
+  }
+
+  @override
+  Future<void> resume() async {
+    await _player.resume();
+    _emit(_snapshot.copyWith(isPlaying: true, isPaused: false));
+  }
+
+  @override
+  Future<void> stop() async {
+    await _player.stop();
+    _emit(
+      _snapshot.copyWith(
+        isPlaying: false,
+        isPaused: false,
+        position: Duration.zero,
+        scope: SoundtrackPlaybackScope.idle,
+      ),
+    );
+  }
+
+  @override
+  Future<void> setLoopEnabled(bool enabled) async {
+    await _player.setReleaseMode(
+      enabled ? audio_player.ReleaseMode.loop : audio_player.ReleaseMode.stop,
+    );
+    _emit(_snapshot.copyWith(isLoopEnabled: enabled));
+  }
+
+  @override
+  Future<void> dispose() async {
+    await _player.dispose();
+    await _controller.close();
+  }
+
+  void _handlePlayerState(audio_player.PlayerState state) {
+    switch (state) {
+      case audio_player.PlayerState.playing:
+        _emit(_snapshot.copyWith(isPlaying: true, isPaused: false));
+        break;
+      case audio_player.PlayerState.paused:
+        _emit(_snapshot.copyWith(isPlaying: false, isPaused: true));
+        break;
+      case audio_player.PlayerState.stopped:
+        _emit(_snapshot.copyWith(isPlaying: false, isPaused: false));
+        break;
+      case audio_player.PlayerState.completed:
+        _emit(
+          _snapshot.copyWith(
+            isPlaying: false,
+            isPaused: false,
+            position: Duration.zero,
+          ),
+        );
+        break;
+      case audio_player.PlayerState.disposed:
+        _emit(SoundtrackPlaybackSnapshot.idle());
+        break;
+    }
+  }
+
+  void _emit(SoundtrackPlaybackSnapshot next) {
+    _snapshot = next;
+    if (!_controller.isClosed) {
+      _controller.add(next);
+    }
+  }
+}
+
+class _DefaultMusicPlaybackServiceBridge extends MusicPlaybackService {
+  const _DefaultMusicPlaybackServiceBridge();
+
+  static final AudioPlayersMusicPlaybackService _service =
+      AudioPlayersMusicPlaybackService();
+
+  @override
+  Stream<SoundtrackPlaybackSnapshot> get changes => _service.changes;
+
+  @override
+  SoundtrackPlaybackSnapshot get snapshot => _service.snapshot;
+
+  @override
+  Future<void> dispose() async {}
+
+  @override
+  Future<void> pause() => _service.pause();
+
+  @override
+  Future<void> playTrack(LocalSoundtrackTrack track) => _service.playTrack(track);
+
+  @override
+  Future<void> previewTrack(LocalSoundtrackTrack track) =>
+      _service.previewTrack(track);
+
+  @override
+  Future<void> resume() => _service.resume();
+
+  @override
+  Future<void> setLoopEnabled(bool enabled) => _service.setLoopEnabled(enabled);
+
+  @override
+  Future<void> stop() => _service.stop();
 }
 
 abstract class DiceRoller {
@@ -263,6 +553,21 @@ Future<SelectedChatImage?> pickChatImage() async {
   final bytes = await file.readAsBytes();
 
   return SelectedChatImage(name: file.name, bytes: bytes);
+}
+
+Future<SelectedAudioTrack?> pickAudioTrack() async {
+  const audioTypeGroup = XTypeGroup(
+    label: 'audio',
+    extensions: ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'opus'],
+  );
+
+  final file = await openFile(acceptedTypeGroups: [audioTypeGroup]);
+
+  if (file == null || file.path.isEmpty) {
+    return null;
+  }
+
+  return SelectedAudioTrack(name: file.name, path: file.path);
 }
 
 class BootstrapShell extends StatelessWidget {
@@ -1290,7 +1595,9 @@ class LinuxAudioControlService extends AudioControlService {
 class SessionShell extends StatefulWidget {
   const SessionShell({
     required this.imagePicker,
+    required this.trackPicker,
     required this.audioService,
+    required this.musicPlaybackService,
     required this.diceRoller,
     required this.currentUser,
     required this.authService,
@@ -1300,7 +1607,9 @@ class SessionShell extends StatefulWidget {
   });
 
   final ChatImagePicker imagePicker;
+  final AudioTrackPicker trackPicker;
   final AudioControlService audioService;
+  final MusicPlaybackService musicPlaybackService;
   final DiceRoller diceRoller;
   final CriticalUser currentUser;
   final UserAuthService authService;
@@ -1326,6 +1635,7 @@ class _SessionShellState extends State<SessionShell> {
       imageBytes: _demoImageBytes,
     ),
   ].toList();
+  final List<LocalSoundtrackTrack> _soundtracks = [];
   late final List<DiceRollRecord> _diceHistory = [
     DiceRollRecord(
       author: 'Darian',
@@ -1341,23 +1651,41 @@ class _SessionShellState extends State<SessionShell> {
   ];
 
   AudioSnapshot _audioSnapshot = AudioSnapshot.loading();
+  SoundtrackPlaybackSnapshot _soundtrackSnapshot =
+      SoundtrackPlaybackSnapshot.idle();
   bool _isPickingImage = false;
+  bool _isPickingTrack = false;
   bool _isAudioBusy = false;
+  bool _isMusicBusy = false;
   bool _isBotPlaying = false;
   bool _isMicMuted = false;
   bool _isSelfMonitoring = false;
   double _selfInputLevel = 0;
+  String? _selectedTrackId;
   StreamSubscription<double>? _inputLevelSubscription;
+  StreamSubscription<SoundtrackPlaybackSnapshot>? _soundtrackSubscription;
 
   @override
   void initState() {
     super.initState();
+    _soundtrackSnapshot = widget.musicPlaybackService.snapshot;
+    _soundtrackSubscription = widget.musicPlaybackService.changes.listen((state) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _soundtrackSnapshot = state;
+        _isMusicBusy = false;
+      });
+    });
     unawaited(_loadAudioSnapshot());
   }
 
   @override
   void dispose() {
     _inputLevelSubscription?.cancel();
+    _soundtrackSubscription?.cancel();
     unawaited(widget.audioService.stopInputMonitoring());
     super.dispose();
   }
@@ -1601,6 +1929,123 @@ class _SessionShellState extends State<SessionShell> {
     }
   }
 
+  Future<void> _addSoundtrack() async {
+    if (_isPickingTrack) {
+      return;
+    }
+
+    setState(() {
+      _isPickingTrack = true;
+    });
+
+    try {
+      final selected = await widget.trackPicker();
+      if (!mounted || selected == null) {
+        return;
+      }
+
+      final track = LocalSoundtrackTrack(
+        id: 'track-${DateTime.now().microsecondsSinceEpoch}',
+        name: selected.name,
+        path: selected.path,
+      );
+
+      setState(() {
+        _soundtracks.insert(0, track);
+        _selectedTrackId = track.id;
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isPickingTrack = false;
+        });
+      }
+    }
+  }
+
+  void _selectTrack(String trackId) {
+    setState(() {
+      _selectedTrackId = trackId;
+    });
+  }
+
+  LocalSoundtrackTrack? get _selectedTrack {
+    final selectedId = _selectedTrackId;
+    if (selectedId == null) {
+      return _soundtracks.isNotEmpty ? _soundtracks.first : null;
+    }
+    return _soundtracks.where((track) => track.id == selectedId).firstOrNull;
+  }
+
+  Future<void> _previewTrack() async {
+    final track = _selectedTrack;
+    if (track == null || _isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(() => widget.musicPlaybackService.previewTrack(track));
+  }
+
+  Future<void> _playTrack() async {
+    final track = _selectedTrack;
+    if (track == null || _isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(() => widget.musicPlaybackService.playTrack(track));
+  }
+
+  Future<void> _pauseTrack() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(widget.musicPlaybackService.pause);
+  }
+
+  Future<void> _resumeTrack() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(widget.musicPlaybackService.resume);
+  }
+
+  Future<void> _stopTrack() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(widget.musicPlaybackService.stop);
+  }
+
+  Future<void> _toggleTrackLoop() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(
+      () => widget.musicPlaybackService.setLoopEnabled(
+        !_soundtrackSnapshot.isLoopEnabled,
+      ),
+    );
+  }
+
+  Future<void> _runMusicAction(Future<void> Function() action) async {
+    setState(() {
+      _isMusicBusy = true;
+    });
+
+    try {
+      await action();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _soundtrackSnapshot = _soundtrackSnapshot.copyWith(
+          error: error.toString(),
+        );
+        _isMusicBusy = false;
+      });
+    }
+  }
+
   DiceRollRecord _submitDiceRoll(String expression) {
     final record = widget.diceRoller.roll(
       expression,
@@ -1712,6 +2157,19 @@ class _SessionShellState extends State<SessionShell> {
                               diceHistory: _diceHistory,
                               onDiceSubmitted: _submitDiceRoll,
                               onClearDiceHistory: _clearDiceHistory,
+                              soundtracks: _soundtracks,
+                              selectedTrackId: _selectedTrackId,
+                              soundtrackSnapshot: _soundtrackSnapshot,
+                              isMusicBusy: _isMusicBusy,
+                              isPickingTrack: _isPickingTrack,
+                              onAddTrack: _addSoundtrack,
+                              onSelectTrack: _selectTrack,
+                              onPreviewTrack: _previewTrack,
+                              onPlayTrack: _playTrack,
+                              onResumeTrack: _resumeTrack,
+                              onPauseTrack: _pauseTrack,
+                              onStopTrack: _stopTrack,
+                              onToggleTrackLoop: _toggleTrackLoop,
                             );
                           }
 
@@ -1737,6 +2195,19 @@ class _SessionShellState extends State<SessionShell> {
                             diceHistory: _diceHistory,
                             onDiceSubmitted: _submitDiceRoll,
                             onClearDiceHistory: _clearDiceHistory,
+                            soundtracks: _soundtracks,
+                            selectedTrackId: _selectedTrackId,
+                            soundtrackSnapshot: _soundtrackSnapshot,
+                            isMusicBusy: _isMusicBusy,
+                            isPickingTrack: _isPickingTrack,
+                            onAddTrack: _addSoundtrack,
+                            onSelectTrack: _selectTrack,
+                            onPreviewTrack: _previewTrack,
+                            onPlayTrack: _playTrack,
+                            onResumeTrack: _resumeTrack,
+                            onPauseTrack: _pauseTrack,
+                            onStopTrack: _stopTrack,
+                            onToggleTrackLoop: _toggleTrackLoop,
                           );
                         },
                       ),
@@ -1775,6 +2246,19 @@ class WideSessionLayout extends StatelessWidget {
     required this.diceHistory,
     required this.onDiceSubmitted,
     required this.onClearDiceHistory,
+    required this.soundtracks,
+    required this.selectedTrackId,
+    required this.soundtrackSnapshot,
+    required this.isMusicBusy,
+    required this.isPickingTrack,
+    required this.onAddTrack,
+    required this.onSelectTrack,
+    required this.onPreviewTrack,
+    required this.onPlayTrack,
+    required this.onResumeTrack,
+    required this.onPauseTrack,
+    required this.onStopTrack,
+    required this.onToggleTrackLoop,
     super.key,
   });
 
@@ -1799,6 +2283,19 @@ class WideSessionLayout extends StatelessWidget {
   final List<DiceRollRecord> diceHistory;
   final DiceRollRecord Function(String expression) onDiceSubmitted;
   final VoidCallback onClearDiceHistory;
+  final List<LocalSoundtrackTrack> soundtracks;
+  final String? selectedTrackId;
+  final SoundtrackPlaybackSnapshot soundtrackSnapshot;
+  final bool isMusicBusy;
+  final bool isPickingTrack;
+  final Future<void> Function() onAddTrack;
+  final ValueChanged<String> onSelectTrack;
+  final Future<void> Function() onPreviewTrack;
+  final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onResumeTrack;
+  final Future<void> Function() onPauseTrack;
+  final Future<void> Function() onStopTrack;
+  final Future<void> Function() onToggleTrackLoop;
 
   @override
   Widget build(BuildContext context) {
@@ -1838,6 +2335,19 @@ class WideSessionLayout extends StatelessWidget {
           child: SideToolsPanel(
             currentUser: currentUser,
             onEditProfile: onEditProfile,
+            soundtracks: soundtracks,
+            selectedTrackId: selectedTrackId,
+            soundtrackSnapshot: soundtrackSnapshot,
+            isMusicBusy: isMusicBusy,
+            isPickingTrack: isPickingTrack,
+            onAddTrack: onAddTrack,
+            onSelectTrack: onSelectTrack,
+            onPreviewTrack: onPreviewTrack,
+            onPlayTrack: onPlayTrack,
+            onResumeTrack: onResumeTrack,
+            onPauseTrack: onPauseTrack,
+            onStopTrack: onStopTrack,
+            onToggleTrackLoop: onToggleTrackLoop,
             diceHistory: diceHistory,
             onDiceSubmitted: onDiceSubmitted,
             onClearDiceHistory: onClearDiceHistory,
@@ -1871,6 +2381,19 @@ class CompactSessionLayout extends StatelessWidget {
     required this.diceHistory,
     required this.onDiceSubmitted,
     required this.onClearDiceHistory,
+    required this.soundtracks,
+    required this.selectedTrackId,
+    required this.soundtrackSnapshot,
+    required this.isMusicBusy,
+    required this.isPickingTrack,
+    required this.onAddTrack,
+    required this.onSelectTrack,
+    required this.onPreviewTrack,
+    required this.onPlayTrack,
+    required this.onResumeTrack,
+    required this.onPauseTrack,
+    required this.onStopTrack,
+    required this.onToggleTrackLoop,
     super.key,
   });
 
@@ -1895,6 +2418,19 @@ class CompactSessionLayout extends StatelessWidget {
   final List<DiceRollRecord> diceHistory;
   final DiceRollRecord Function(String expression) onDiceSubmitted;
   final VoidCallback onClearDiceHistory;
+  final List<LocalSoundtrackTrack> soundtracks;
+  final String? selectedTrackId;
+  final SoundtrackPlaybackSnapshot soundtrackSnapshot;
+  final bool isMusicBusy;
+  final bool isPickingTrack;
+  final Future<void> Function() onAddTrack;
+  final ValueChanged<String> onSelectTrack;
+  final Future<void> Function() onPreviewTrack;
+  final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onResumeTrack;
+  final Future<void> Function() onPauseTrack;
+  final Future<void> Function() onStopTrack;
+  final Future<void> Function() onToggleTrackLoop;
 
   @override
   Widget build(BuildContext context) {
@@ -1936,6 +2472,19 @@ class CompactSessionLayout extends StatelessWidget {
                 child: SideToolsPanel(
                   currentUser: currentUser,
                   onEditProfile: onEditProfile,
+                  soundtracks: soundtracks,
+                  selectedTrackId: selectedTrackId,
+                  soundtrackSnapshot: soundtrackSnapshot,
+                  isMusicBusy: isMusicBusy,
+                  isPickingTrack: isPickingTrack,
+                  onAddTrack: onAddTrack,
+                  onSelectTrack: onSelectTrack,
+                  onPreviewTrack: onPreviewTrack,
+                  onPlayTrack: onPlayTrack,
+                  onResumeTrack: onResumeTrack,
+                  onPauseTrack: onPauseTrack,
+                  onStopTrack: onStopTrack,
+                  onToggleTrackLoop: onToggleTrackLoop,
                   diceHistory: diceHistory,
                   onDiceSubmitted: onDiceSubmitted,
                   onClearDiceHistory: onClearDiceHistory,
@@ -3092,6 +3641,19 @@ class SideToolsPanel extends StatelessWidget {
   const SideToolsPanel({
     required this.currentUser,
     required this.onEditProfile,
+    required this.soundtracks,
+    required this.selectedTrackId,
+    required this.soundtrackSnapshot,
+    required this.isMusicBusy,
+    required this.isPickingTrack,
+    required this.onAddTrack,
+    required this.onSelectTrack,
+    required this.onPreviewTrack,
+    required this.onPlayTrack,
+    required this.onResumeTrack,
+    required this.onPauseTrack,
+    required this.onStopTrack,
+    required this.onToggleTrackLoop,
     required this.diceHistory,
     required this.onDiceSubmitted,
     required this.onClearDiceHistory,
@@ -3100,6 +3662,19 @@ class SideToolsPanel extends StatelessWidget {
 
   final CriticalUser currentUser;
   final Future<void> Function() onEditProfile;
+  final List<LocalSoundtrackTrack> soundtracks;
+  final String? selectedTrackId;
+  final SoundtrackPlaybackSnapshot soundtrackSnapshot;
+  final bool isMusicBusy;
+  final bool isPickingTrack;
+  final Future<void> Function() onAddTrack;
+  final ValueChanged<String> onSelectTrack;
+  final Future<void> Function() onPreviewTrack;
+  final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onResumeTrack;
+  final Future<void> Function() onPauseTrack;
+  final Future<void> Function() onStopTrack;
+  final Future<void> Function() onToggleTrackLoop;
   final List<DiceRollRecord> diceHistory;
   final DiceRollRecord Function(String expression) onDiceSubmitted;
   final VoidCallback onClearDiceHistory;
@@ -3108,7 +3683,24 @@ class SideToolsPanel extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(
       children: [
-        const Expanded(flex: 3, child: MusicPanel()),
+        Expanded(
+          flex: 3,
+          child: MusicPanel(
+            tracks: soundtracks,
+            selectedTrackId: selectedTrackId,
+            snapshot: soundtrackSnapshot,
+            isBusy: isMusicBusy,
+            isPickingTrack: isPickingTrack,
+            onAddTrack: onAddTrack,
+            onSelectTrack: onSelectTrack,
+            onPreviewTrack: onPreviewTrack,
+            onPlayTrack: onPlayTrack,
+            onResumeTrack: onResumeTrack,
+            onPauseTrack: onPauseTrack,
+            onStopTrack: onStopTrack,
+            onToggleTrackLoop: onToggleTrackLoop,
+          ),
+        ),
         const SizedBox(height: 12),
         Expanded(
           flex: 2,
@@ -3132,13 +3724,53 @@ class SideToolsPanel extends StatelessWidget {
 }
 
 class MusicPanel extends StatelessWidget {
-  const MusicPanel({super.key});
+  const MusicPanel({
+    required this.tracks,
+    required this.selectedTrackId,
+    required this.snapshot,
+    required this.isBusy,
+    required this.isPickingTrack,
+    required this.onAddTrack,
+    required this.onSelectTrack,
+    required this.onPreviewTrack,
+    required this.onPlayTrack,
+    required this.onResumeTrack,
+    required this.onPauseTrack,
+    required this.onStopTrack,
+    required this.onToggleTrackLoop,
+    super.key,
+  });
+
+  final List<LocalSoundtrackTrack> tracks;
+  final String? selectedTrackId;
+  final SoundtrackPlaybackSnapshot snapshot;
+  final bool isBusy;
+  final bool isPickingTrack;
+  final Future<void> Function() onAddTrack;
+  final ValueChanged<String> onSelectTrack;
+  final Future<void> Function() onPreviewTrack;
+  final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onResumeTrack;
+  final Future<void> Function() onPauseTrack;
+  final Future<void> Function() onStopTrack;
+  final Future<void> Function() onToggleTrackLoop;
 
   @override
   Widget build(BuildContext context) {
+    final activeTrack = tracks
+        .where((track) => track.id == snapshot.activeTrackId)
+        .firstOrNull;
+    final selectedTrack = tracks
+        .where((track) => track.id == selectedTrackId)
+        .firstOrNull;
+
     return Panel(
       title: 'Trilha',
-      trailing: IconToolButton(icon: Icons.playlist_add, label: 'Adicionar'),
+      trailing: IconToolButton(
+        icon: Icons.playlist_add,
+        label: 'Adicionar trilha',
+        onPressed: isPickingTrack ? null : onAddTrack,
+      ),
       child: SingleChildScrollView(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3150,41 +3782,90 @@ class MusicPanel extends StatelessWidget {
                 borderRadius: BorderRadius.circular(8),
                 border: Border.all(color: const Color(0xFF2A2F33)),
               ),
-              child: const Column(
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Chuva nas muralhas',
+                    activeTrack?.name ?? selectedTrack?.name ?? 'Nenhuma trilha',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(fontWeight: FontWeight.w800),
                   ),
-                  SizedBox(height: 6),
-                  LinearProgressIndicator(value: .38, minHeight: 5),
-                  SizedBox(height: 8),
-                  Text('01:14 / 03:12', style: TextStyle(fontSize: 12)),
+                  const SizedBox(height: 6),
+                  LinearProgressIndicator(
+                    value: snapshot.progress,
+                    minHeight: 5,
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '${snapshot.scopeLabel}  ${formatDuration(snapshot.position)} / ${formatDuration(snapshot.duration)}',
+                    style: const TextStyle(fontSize: 12),
+                  ),
                 ],
               ),
             ),
             const SizedBox(height: 10),
             Row(
               children: [
-                IconToolButton(icon: Icons.play_arrow, label: 'Tocar'),
+                IconToolButton(
+                  icon: Icons.headphones,
+                  label: 'Preview',
+                  onPressed: tracks.isEmpty || isBusy ? null : onPreviewTrack,
+                ),
                 const SizedBox(width: 8),
-                IconToolButton(icon: Icons.pause, label: 'Pausar'),
+                IconToolButton(
+                  icon: snapshot.isPaused ? Icons.play_arrow : Icons.campaign,
+                  label: snapshot.isPaused ? 'Retomar' : 'Tocar na sala',
+                  onPressed: tracks.isEmpty || isBusy
+                      ? null
+                      : snapshot.isPaused
+                      ? onResumeTrack
+                      : onPlayTrack,
+                ),
                 const SizedBox(width: 8),
-                IconToolButton(icon: Icons.stop, label: 'Parar'),
+                IconToolButton(
+                  icon: Icons.pause,
+                  label: 'Pausar',
+                  onPressed: !snapshot.isPlaying || isBusy ? null : onPauseTrack,
+                ),
                 const SizedBox(width: 8),
-                IconToolButton(icon: Icons.repeat, label: 'Loop'),
+                IconToolButton(
+                  icon: Icons.stop,
+                  label: 'Parar',
+                  onPressed: !snapshot.hasActiveTrack || isBusy ? null : onStopTrack,
+                ),
+                const SizedBox(width: 8),
+                IconToolButton(
+                  icon: snapshot.isLoopEnabled ? Icons.repeat_one : Icons.repeat,
+                  label: 'Loop simples',
+                  onPressed: tracks.isEmpty || isBusy ? null : onToggleTrackLoop,
+                ),
               ],
             ),
+            if (snapshot.error != null) ...[
+              const SizedBox(height: 10),
+              ErrorStrip(message: snapshot.error!),
+            ],
             const SizedBox(height: 12),
-            const TrackTile(
-              title: 'Preview privado',
-              subtitle: 'Somente mestre',
-            ),
-            const SizedBox(height: 8),
-            const TrackTile(title: 'Combate curto', subtitle: 'Pronta'),
+            if (tracks.isEmpty)
+              const EmptyMusicLibrary()
+            else
+              Column(
+                children: [
+                  for (var index = 0; index < tracks.length; index++) ...[
+                    TrackTile(
+                      track: tracks[index],
+                      selected: tracks[index].id == selectedTrackId,
+                      active: tracks[index].id == snapshot.activeTrackId,
+                      subtitle: tracks[index].id == snapshot.activeTrackId
+                          ? snapshot.scopeLabel
+                          : 'Arquivo local',
+                      onTap: () => onSelectTrack(tracks[index].id),
+                    ),
+                    if (index != tracks.length - 1) const SizedBox(height: 8),
+                  ],
+                ],
+              ),
           ],
         ),
       ),
@@ -3193,43 +3874,92 @@ class MusicPanel extends StatelessWidget {
 }
 
 class TrackTile extends StatelessWidget {
-  const TrackTile({required this.title, required this.subtitle, super.key});
+  const TrackTile({
+    required this.track,
+    required this.subtitle,
+    required this.onTap,
+    this.selected = false,
+    this.active = false,
+    super.key,
+  });
 
-  final String title;
+  final LocalSoundtrackTrack track;
   final String subtitle;
+  final VoidCallback onTap;
+  final bool selected;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onTap,
+      child: Container(
+        height: 54,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF223D38) : const Color(0xFF1A1D20),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: selected ? const Color(0xFF356F62) : const Color(0xFF2A2F33),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              active ? Icons.graphic_eq : Icons.music_note,
+              size: 18,
+              color: active ? const Color(0xFF80DFC8) : const Color(0xFFE6B450),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    track.name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFFAEB8B5),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class EmptyMusicLibrary extends StatelessWidget {
+  const EmptyMusicLibrary({super.key});
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      height: 50,
-      padding: const EdgeInsets.symmetric(horizontal: 10),
+      height: 92,
+      alignment: Alignment.center,
       decoration: BoxDecoration(
         color: const Color(0xFF1A1D20),
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Row(
-        children: [
-          const Icon(Icons.music_note, size: 18, color: Color(0xFFE6B450)),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, maxLines: 1, overflow: TextOverflow.ellipsis),
-                Text(
-                  subtitle,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: Color(0xFFAEB8B5),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
+      child: const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 16),
+        child: Text(
+          'Adicione um arquivo local para habilitar preview, play, pause, stop e loop.',
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Color(0xFFAEB8B5), height: 1.4),
+        ),
       ),
     );
   }
@@ -4390,6 +5120,28 @@ class SelectedChatImage {
   final Uint8List bytes;
 }
 
+class SelectedAudioTrack {
+  const SelectedAudioTrack({
+    required this.name,
+    required this.path,
+  });
+
+  final String name;
+  final String path;
+}
+
+class LocalSoundtrackTrack {
+  const LocalSoundtrackTrack({
+    required this.id,
+    required this.name,
+    required this.path,
+  });
+
+  final String id;
+  final String name;
+  final String path;
+}
+
 String sanitizeObsidianMarkdown(String markdown) {
   final withoutMarkdownLinks = markdown.replaceAllMapped(
     RegExp(r'\[([^\]]+)\]\(([^)]+)\)'),
@@ -4403,10 +5155,24 @@ String sanitizeObsidianMarkdown(String markdown) {
   return withoutWikiLinks;
 }
 
+const _soundtrackSentinel = Object();
+
 extension on String {
   String ifEmpty(String fallback) {
     return trim().isEmpty ? fallback : this;
   }
+}
+
+String formatDuration(Duration value) {
+  final minutes = value.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final seconds = value.inSeconds.remainder(60).toString().padLeft(2, '0');
+  final hours = value.inHours;
+
+  if (hours > 0) {
+    return '${hours.toString().padLeft(2, '0')}:$minutes:$seconds';
+  }
+
+  return '$minutes:$seconds';
 }
 
 final Uint8List _demoImageBytes = Uint8List.fromList(<int>[
