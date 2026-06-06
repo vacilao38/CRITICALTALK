@@ -29,6 +29,23 @@ void main() {
     expect(request.normalizedExpression, '4d6kh3+2');
   });
 
+  test(
+    'resolves direct remote audio links and rejects platform pages',
+    () async {
+      final directTrack = await resolveAudioTrackLink(
+        'https://cdn.example.test/music/theme.mp3',
+      );
+
+      expect(directTrack?.name, 'theme.mp3');
+      expect(directTrack?.source, AudioTrackSource.remoteUrl);
+
+      expect(
+        resolveAudioTrackLink('https://open.spotify.com/track/abc'),
+        throwsA(isA<MusicLinkResolverException>()),
+      );
+    },
+  );
+
   testWidgets('renders the base session layout', (WidgetTester tester) async {
     await tester.binding.setSurfaceSize(const Size(1366, 768));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -285,20 +302,22 @@ void main() {
     expect(find.text('mensagem recebida'), findsOneWidget);
   });
 
-  testWidgets('adds a local soundtrack and controls preview, play, pause, stop and loop', (
+  testWidgets('adds a local soundtrack and controls playback queue', (
     WidgetTester tester,
   ) async {
     final musicService = FakeMusicPlaybackService();
+    var pickerCallCount = 0;
+    final selectedTracks = [
+      const SelectedAudioTrack(name: 'campfire.mp3', path: '/tmp/campfire.mp3'),
+      const SelectedAudioTrack(name: 'storm.ogg', path: '/tmp/storm.ogg'),
+    ];
 
     await tester.binding.setSurfaceSize(const Size(1366, 768));
     addTearDown(() => tester.binding.setSurfaceSize(null));
 
     await tester.pumpWidget(
       _buildApp(
-        trackPicker: () async => const SelectedAudioTrack(
-          name: 'campfire.mp3',
-          path: '/tmp/campfire.mp3',
-        ),
+        trackPicker: () async => selectedTracks[pickerCallCount++],
         musicPlaybackService: musicService,
       ),
     );
@@ -308,6 +327,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('campfire.mp3'), findsWidgets);
+
+    await tester.tap(find.byTooltip('Adicionar trilha'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('storm.ogg'), findsWidgets);
 
     await tester.tap(find.byTooltip('Preview'));
     await tester.pumpAndSettle();
@@ -319,6 +343,11 @@ void main() {
     expect(musicService.playCount, 1);
     expect(find.text('Ao vivo na sala'), findsWidgets);
 
+    await tester.tap(find.byTooltip('Adicionar a fila'));
+    await tester.pumpAndSettle();
+    expect(musicService.enqueueCount, 1);
+    expect(find.text('1/2 na fila'), findsWidgets);
+
     await tester.tap(find.byTooltip('Pausar'));
     await tester.pumpAndSettle();
     expect(musicService.pauseCount, 1);
@@ -327,13 +356,62 @@ void main() {
     await tester.pumpAndSettle();
     expect(musicService.resumeCount, 1);
 
-    await tester.tap(find.byTooltip('Loop simples'));
+    await tester.tap(find.byTooltip('Loop da faixa'));
     await tester.pumpAndSettle();
     expect(musicService.loopToggleCount, 1);
+
+    await tester.tap(find.byTooltip('Loop da fila'));
+    await tester.pumpAndSettle();
+    expect(musicService.queueLoopToggleCount, 1);
+
+    await tester.tap(find.byTooltip('Limpar fila'));
+    await tester.pumpAndSettle();
+    expect(musicService.clearQueueCount, 1);
+
+    await tester.tap(find.byTooltip('Pular'));
+    await tester.pumpAndSettle();
+    expect(musicService.skipCount, 1);
 
     await tester.tap(find.byTooltip('Parar'));
     await tester.pumpAndSettle();
     expect(musicService.stopCount, 1);
+  });
+
+  testWidgets('adds a remote soundtrack through a link resolver', (
+    WidgetTester tester,
+  ) async {
+    String? resolvedLink;
+
+    await tester.binding.setSurfaceSize(const Size(1366, 768));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      _buildApp(
+        trackLinkResolver: (link) async {
+          resolvedLink = link;
+          return SelectedAudioTrack(
+            name: 'theme.ogg',
+            path: link,
+            source: AudioTrackSource.remoteUrl,
+          );
+        },
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Adicionar link'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(
+      find.widgetWithText(TextField, 'https://servidor/audio.mp3'),
+      'https://example.test/theme.ogg',
+    );
+    await tester.tap(find.widgetWithText(FilledButton, 'Adicionar'));
+    await tester.pumpAndSettle();
+
+    expect(resolvedLink, 'https://example.test/theme.ogg');
+    expect(find.text('theme.ogg'), findsWidgets);
+    expect(find.text('Link remoto'), findsOneWidget);
   });
 
   testWidgets(
@@ -366,10 +444,12 @@ Widget _buildApp({
   UserAuthService? authService,
   DiceRoller? diceRoller,
   MusicPlaybackService? musicPlaybackService,
+  AudioTrackLinkResolver trackLinkResolver = resolveAudioTrackLink,
 }) {
   return CriticalTalkApp(
     imagePicker: imagePicker,
     trackPicker: trackPicker,
+    trackLinkResolver: trackLinkResolver,
     audioService: audioService ?? FakeAudioControlService(),
     musicPlaybackService: musicPlaybackService ?? FakeMusicPlaybackService(),
     userAuthService: authService ?? FakeUserAuthService(),
@@ -597,7 +677,13 @@ class FakeMusicPlaybackService extends MusicPlaybackService {
   int pauseCount = 0;
   int resumeCount = 0;
   int stopCount = 0;
+  int enqueueCount = 0;
+  int skipCount = 0;
+  int clearQueueCount = 0;
   int loopToggleCount = 0;
+  int queueLoopToggleCount = 0;
+  final List<LocalSoundtrackTrack> _queue = [];
+  int _activeQueueIndex = -1;
 
   @override
   Stream<SoundtrackPlaybackSnapshot> get changes => _controller.stream;
@@ -619,6 +705,10 @@ class FakeMusicPlaybackService extends MusicPlaybackService {
   @override
   Future<void> playTrack(LocalSoundtrackTrack track) async {
     playCount++;
+    _queue
+      ..clear()
+      ..add(track);
+    _activeQueueIndex = 0;
     _emit(
       _snapshot.copyWith(
         activeTrackId: track.id,
@@ -627,8 +717,22 @@ class FakeMusicPlaybackService extends MusicPlaybackService {
         isPaused: false,
         duration: const Duration(minutes: 3, seconds: 12),
         position: const Duration(minutes: 1, seconds: 14),
+        queueTrackIds: _queueIds(),
+        activeQueueIndex: _activeQueueIndex,
       ),
     );
+  }
+
+  @override
+  Future<void> enqueueTrack(LocalSoundtrackTrack track) async {
+    enqueueCount++;
+    if (_queue.isEmpty) {
+      await playTrack(track);
+      return;
+    }
+
+    _queue.add(track);
+    _emit(_snapshot.copyWith(queueTrackIds: _queueIds()));
   }
 
   @override
@@ -659,14 +763,67 @@ class FakeMusicPlaybackService extends MusicPlaybackService {
   }
 
   @override
-  Future<void> stop() async {
-    stopCount++;
+  Future<void> setQueueLoopEnabled(bool enabled) async {
+    queueLoopToggleCount++;
+    _emit(_snapshot.copyWith(isQueueLoopEnabled: enabled));
+  }
+
+  @override
+  Future<void> skip() async {
+    skipCount++;
+    if (_activeQueueIndex + 1 >= _queue.length) {
+      await stop();
+      return;
+    }
+
+    _activeQueueIndex++;
+    final nextTrack = _queue[_activeQueueIndex];
     _emit(
       _snapshot.copyWith(
+        activeTrackId: nextTrack.id,
+        isPlaying: true,
+        isPaused: false,
+        queueTrackIds: _queueIds(),
+        activeQueueIndex: _activeQueueIndex,
+      ),
+    );
+  }
+
+  @override
+  Future<void> clearQueue() async {
+    clearQueueCount++;
+    if (_activeQueueIndex >= 0 && _activeQueueIndex < _queue.length) {
+      final currentTrack = _queue[_activeQueueIndex];
+      _queue
+        ..clear()
+        ..add(currentTrack);
+      _activeQueueIndex = 0;
+    } else {
+      _queue.clear();
+      _activeQueueIndex = -1;
+    }
+    _emit(
+      _snapshot.copyWith(
+        queueTrackIds: _queueIds(),
+        activeQueueIndex: _activeQueueIndex,
+      ),
+    );
+  }
+
+  @override
+  Future<void> stop() async {
+    stopCount++;
+    _queue.clear();
+    _activeQueueIndex = -1;
+    _emit(
+      _snapshot.copyWith(
+        activeTrackId: null,
         isPlaying: false,
         isPaused: false,
         position: Duration.zero,
         scope: SoundtrackPlaybackScope.idle,
+        queueTrackIds: <String>[],
+        activeQueueIndex: -1,
       ),
     );
   }
@@ -677,6 +834,8 @@ class FakeMusicPlaybackService extends MusicPlaybackService {
       _controller.add(snapshot);
     }
   }
+
+  List<String> _queueIds() => [for (final track in _queue) track.id];
 }
 
 final Uint8List _fakeImageBytes = Uint8List.fromList(<int>[

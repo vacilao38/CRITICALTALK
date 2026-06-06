@@ -15,6 +15,8 @@ import 'package:critical_talk/user_foundation.dart';
 
 typedef ChatImagePicker = Future<SelectedChatImage?> Function();
 typedef AudioTrackPicker = Future<SelectedAudioTrack?> Function();
+typedef AudioTrackLinkResolver =
+    Future<SelectedAudioTrack?> Function(String link);
 
 void main() {
   runApp(const CriticalTalkApp());
@@ -25,6 +27,7 @@ class CriticalTalkApp extends StatefulWidget {
     super.key,
     this.imagePicker = pickChatImage,
     this.trackPicker = pickAudioTrack,
+    this.trackLinkResolver = resolveAudioTrackLink,
     this.audioService = const LinuxAudioControlService(),
     this.musicPlaybackService = const _DefaultMusicPlaybackServiceBridge(),
     this.userAuthService = const _DefaultUserAuthServiceBridge(),
@@ -33,6 +36,7 @@ class CriticalTalkApp extends StatefulWidget {
 
   final ChatImagePicker imagePicker;
   final AudioTrackPicker trackPicker;
+  final AudioTrackLinkResolver trackLinkResolver;
   final AudioControlService audioService;
   final MusicPlaybackService musicPlaybackService;
   final UserAuthService userAuthService;
@@ -121,6 +125,7 @@ class _CriticalTalkAppState extends State<CriticalTalkApp> {
           return SessionShell(
             imagePicker: widget.imagePicker,
             trackPicker: widget.trackPicker,
+            trackLinkResolver: widget.trackLinkResolver,
             audioService: widget.audioService,
             musicPlaybackService: widget.musicPlaybackService,
             diceRoller: widget.diceRoller,
@@ -192,8 +197,11 @@ class SoundtrackPlaybackSnapshot {
     required this.isPlaying,
     required this.isPaused,
     required this.isLoopEnabled,
+    required this.isQueueLoopEnabled,
     required this.position,
     required this.duration,
+    required this.queueTrackIds,
+    required this.activeQueueIndex,
     this.error,
   });
 
@@ -204,8 +212,11 @@ class SoundtrackPlaybackSnapshot {
       isPlaying: false,
       isPaused: false,
       isLoopEnabled: false,
+      isQueueLoopEnabled: false,
       position: Duration.zero,
       duration: Duration.zero,
+      queueTrackIds: <String>[],
+      activeQueueIndex: -1,
     );
   }
 
@@ -214,11 +225,21 @@ class SoundtrackPlaybackSnapshot {
   final bool isPlaying;
   final bool isPaused;
   final bool isLoopEnabled;
+  final bool isQueueLoopEnabled;
   final Duration position;
   final Duration duration;
+  final List<String> queueTrackIds;
+  final int activeQueueIndex;
   final String? error;
 
   bool get hasActiveTrack => activeTrackId != null;
+
+  int get upcomingTrackCount {
+    if (activeQueueIndex < 0) {
+      return queueTrackIds.length;
+    }
+    return math.max(0, queueTrackIds.length - activeQueueIndex - 1);
+  }
 
   double get progress {
     if (duration.inMilliseconds <= 0) {
@@ -233,14 +254,33 @@ class SoundtrackPlaybackSnapshot {
     SoundtrackPlaybackScope.idle => 'Sem trilha ativa',
   };
 
+  String get queueLabel {
+    if (queueTrackIds.isEmpty) {
+      return 'Fila vazia';
+    }
+
+    final currentPosition = activeQueueIndex >= 0 ? activeQueueIndex + 1 : 0;
+    final total = queueTrackIds.length;
+    final suffix = isQueueLoopEnabled ? ' - loop da fila' : '';
+
+    if (currentPosition <= 0) {
+      return '$total na fila$suffix';
+    }
+
+    return '$currentPosition/$total na fila$suffix';
+  }
+
   SoundtrackPlaybackSnapshot copyWith({
     Object? activeTrackId = _soundtrackSentinel,
     SoundtrackPlaybackScope? scope,
     bool? isPlaying,
     bool? isPaused,
     bool? isLoopEnabled,
+    bool? isQueueLoopEnabled,
     Duration? position,
     Duration? duration,
+    List<String>? queueTrackIds,
+    int? activeQueueIndex,
     Object? error = _soundtrackSentinel,
   }) {
     return SoundtrackPlaybackSnapshot(
@@ -251,8 +291,11 @@ class SoundtrackPlaybackSnapshot {
       isPlaying: isPlaying ?? this.isPlaying,
       isPaused: isPaused ?? this.isPaused,
       isLoopEnabled: isLoopEnabled ?? this.isLoopEnabled,
+      isQueueLoopEnabled: isQueueLoopEnabled ?? this.isQueueLoopEnabled,
       position: position ?? this.position,
       duration: duration ?? this.duration,
+      queueTrackIds: queueTrackIds ?? this.queueTrackIds,
+      activeQueueIndex: activeQueueIndex ?? this.activeQueueIndex,
       error: error == _soundtrackSentinel ? this.error : error as String?,
     );
   }
@@ -269,13 +312,21 @@ abstract class MusicPlaybackService {
 
   Future<void> playTrack(LocalSoundtrackTrack track);
 
+  Future<void> enqueueTrack(LocalSoundtrackTrack track);
+
   Future<void> pause();
 
   Future<void> resume();
 
   Future<void> stop();
 
+  Future<void> skip();
+
+  Future<void> clearQueue();
+
   Future<void> setLoopEnabled(bool enabled);
+
+  Future<void> setQueueLoopEnabled(bool enabled);
 
   Future<void> dispose();
 }
@@ -293,14 +344,7 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
       if (_snapshot.isLoopEnabled) {
         return;
       }
-      _emit(
-        _snapshot.copyWith(
-          isPlaying: false,
-          isPaused: false,
-          position: Duration.zero,
-          scope: SoundtrackPlaybackScope.idle,
-        ),
-      );
+      unawaited(_advanceQueueAfterCompletion());
     });
   }
 
@@ -308,6 +352,8 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
   final StreamController<SoundtrackPlaybackSnapshot> _controller =
       StreamController<SoundtrackPlaybackSnapshot>.broadcast();
   SoundtrackPlaybackSnapshot _snapshot = SoundtrackPlaybackSnapshot.idle();
+  final List<LocalSoundtrackTrack> _queue = [];
+  int _activeQueueIndex = -1;
 
   @override
   SoundtrackPlaybackSnapshot get snapshot => _snapshot;
@@ -322,7 +368,23 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
 
   @override
   Future<void> playTrack(LocalSoundtrackTrack track) async {
+    _queue
+      ..clear()
+      ..add(track);
+    _activeQueueIndex = 0;
     await _startTrack(track, scope: SoundtrackPlaybackScope.room);
+  }
+
+  @override
+  Future<void> enqueueTrack(LocalSoundtrackTrack track) async {
+    if (!_snapshot.hasActiveTrack ||
+        _snapshot.scope != SoundtrackPlaybackScope.room) {
+      await playTrack(track);
+      return;
+    }
+
+    _queue.add(track);
+    _emit(_snapshot.copyWith(queueTrackIds: _queueIds()));
   }
 
   Future<void> _startTrack(
@@ -335,7 +397,7 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
             ? audio_player.ReleaseMode.loop
             : audio_player.ReleaseMode.stop,
       );
-      await _player.play(audio_player.DeviceFileSource(track.path));
+      await _player.play(_audioSourceFor(track));
       _emit(
         _snapshot.copyWith(
           activeTrackId: track.id,
@@ -343,6 +405,12 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
           isPlaying: true,
           isPaused: false,
           position: Duration.zero,
+          queueTrackIds: scope == SoundtrackPlaybackScope.room
+              ? _queueIds()
+              : null,
+          activeQueueIndex: scope == SoundtrackPlaybackScope.room
+              ? _activeQueueIndex
+              : -1,
           error: null,
         ),
       );
@@ -366,12 +434,58 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
   @override
   Future<void> stop() async {
     await _player.stop();
+    _queue.clear();
+    _activeQueueIndex = -1;
     _emit(
       _snapshot.copyWith(
         isPlaying: false,
         isPaused: false,
         position: Duration.zero,
         scope: SoundtrackPlaybackScope.idle,
+        queueTrackIds: <String>[],
+        activeQueueIndex: -1,
+      ),
+    );
+  }
+
+  @override
+  Future<void> skip() async {
+    if (_queue.isEmpty || _activeQueueIndex < 0) {
+      await stop();
+      return;
+    }
+
+    final nextIndex = _activeQueueIndex + 1;
+    if (nextIndex < _queue.length) {
+      await _startQueueTrack(nextIndex);
+      return;
+    }
+
+    if (_snapshot.isQueueLoopEnabled) {
+      await _startQueueTrack(0);
+      return;
+    }
+
+    await stop();
+  }
+
+  @override
+  Future<void> clearQueue() async {
+    if (_activeQueueIndex < 0 || _activeQueueIndex >= _queue.length) {
+      _queue.clear();
+      _activeQueueIndex = -1;
+    } else {
+      final currentTrack = _queue[_activeQueueIndex];
+      _queue
+        ..clear()
+        ..add(currentTrack);
+      _activeQueueIndex = 0;
+    }
+
+    _emit(
+      _snapshot.copyWith(
+        queueTrackIds: _queueIds(),
+        activeQueueIndex: _activeQueueIndex,
       ),
     );
   }
@@ -382,6 +496,11 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
       enabled ? audio_player.ReleaseMode.loop : audio_player.ReleaseMode.stop,
     );
     _emit(_snapshot.copyWith(isLoopEnabled: enabled));
+  }
+
+  @override
+  Future<void> setQueueLoopEnabled(bool enabled) async {
+    _emit(_snapshot.copyWith(isQueueLoopEnabled: enabled));
   }
 
   @override
@@ -402,18 +521,65 @@ class AudioPlayersMusicPlaybackService extends MusicPlaybackService {
         _emit(_snapshot.copyWith(isPlaying: false, isPaused: false));
         break;
       case audio_player.PlayerState.completed:
-        _emit(
-          _snapshot.copyWith(
-            isPlaying: false,
-            isPaused: false,
-            position: Duration.zero,
-          ),
-        );
         break;
       case audio_player.PlayerState.disposed:
         _emit(SoundtrackPlaybackSnapshot.idle());
         break;
     }
+  }
+
+  Future<void> _advanceQueueAfterCompletion() async {
+    if (_snapshot.scope != SoundtrackPlaybackScope.room) {
+      _emit(
+        _snapshot.copyWith(
+          isPlaying: false,
+          isPaused: false,
+          position: Duration.zero,
+          scope: SoundtrackPlaybackScope.idle,
+          activeTrackId: null,
+        ),
+      );
+      return;
+    }
+
+    final nextIndex = _activeQueueIndex + 1;
+    if (nextIndex < _queue.length) {
+      await _startQueueTrack(nextIndex);
+      return;
+    }
+
+    if (_snapshot.isQueueLoopEnabled && _queue.isNotEmpty) {
+      await _startQueueTrack(0);
+      return;
+    }
+
+    _queue.clear();
+    _activeQueueIndex = -1;
+    _emit(
+      _snapshot.copyWith(
+        activeTrackId: null,
+        isPlaying: false,
+        isPaused: false,
+        position: Duration.zero,
+        scope: SoundtrackPlaybackScope.idle,
+        queueTrackIds: <String>[],
+        activeQueueIndex: -1,
+      ),
+    );
+  }
+
+  Future<void> _startQueueTrack(int index) async {
+    _activeQueueIndex = index;
+    await _startTrack(_queue[index], scope: SoundtrackPlaybackScope.room);
+  }
+
+  List<String> _queueIds() => [for (final track in _queue) track.id];
+
+  audio_player.Source _audioSourceFor(LocalSoundtrackTrack track) {
+    return switch (track.source) {
+      AudioTrackSource.localFile => audio_player.DeviceFileSource(track.path),
+      AudioTrackSource.remoteUrl => audio_player.UrlSource(track.path),
+    };
   }
 
   void _emit(SoundtrackPlaybackSnapshot next) {
@@ -440,10 +606,18 @@ class _DefaultMusicPlaybackServiceBridge extends MusicPlaybackService {
   Future<void> dispose() async {}
 
   @override
+  Future<void> clearQueue() => _service.clearQueue();
+
+  @override
+  Future<void> enqueueTrack(LocalSoundtrackTrack track) =>
+      _service.enqueueTrack(track);
+
+  @override
   Future<void> pause() => _service.pause();
 
   @override
-  Future<void> playTrack(LocalSoundtrackTrack track) => _service.playTrack(track);
+  Future<void> playTrack(LocalSoundtrackTrack track) =>
+      _service.playTrack(track);
 
   @override
   Future<void> previewTrack(LocalSoundtrackTrack track) =>
@@ -454,6 +628,13 @@ class _DefaultMusicPlaybackServiceBridge extends MusicPlaybackService {
 
   @override
   Future<void> setLoopEnabled(bool enabled) => _service.setLoopEnabled(enabled);
+
+  @override
+  Future<void> setQueueLoopEnabled(bool enabled) =>
+      _service.setQueueLoopEnabled(enabled);
+
+  @override
+  Future<void> skip() => _service.skip();
 
   @override
   Future<void> stop() => _service.stop();
@@ -568,6 +749,84 @@ Future<SelectedAudioTrack?> pickAudioTrack() async {
   }
 
   return SelectedAudioTrack(name: file.name, path: file.path);
+}
+
+Future<SelectedAudioTrack?> resolveAudioTrackLink(String rawLink) async {
+  final link = rawLink.trim();
+  if (link.isEmpty) {
+    return null;
+  }
+
+  final uri = Uri.tryParse(link);
+  final isHttp = uri != null && (uri.scheme == 'http' || uri.scheme == 'https');
+  if (!isHttp || uri.host.trim().isEmpty) {
+    throw const MusicLinkResolverException(
+      'Cole um link http ou https valido.',
+    );
+  }
+
+  if (_needsLicensedPlatformResolver(uri)) {
+    throw MusicLinkResolverException(
+      'Esse link de ${_platformName(uri)} precisa de um resolvedor licenciado '
+      'ou API oficial antes de tocar no app. Links diretos de audio ja podem '
+      'ser adicionados agora.',
+    );
+  }
+
+  return SelectedAudioTrack(
+    name: _remoteTrackName(uri),
+    path: uri.toString(),
+    source: AudioTrackSource.remoteUrl,
+  );
+}
+
+bool _needsLicensedPlatformResolver(Uri uri) {
+  final host = uri.host.toLowerCase();
+  return host.contains('spotify.com') ||
+      host.contains('youtube.com') ||
+      host.contains('youtu.be') ||
+      host.contains('soundcloud.com') ||
+      host.contains('deezer.com') ||
+      host.contains('tidal.com') ||
+      host.contains('music.apple.com');
+}
+
+String _platformName(Uri uri) {
+  final host = uri.host.toLowerCase();
+  if (host.contains('spotify.com')) {
+    return 'Spotify';
+  }
+  if (host.contains('youtube.com') || host.contains('youtu.be')) {
+    return 'YouTube';
+  }
+  if (host.contains('soundcloud.com')) {
+    return 'SoundCloud';
+  }
+  if (host.contains('deezer.com')) {
+    return 'Deezer';
+  }
+  if (host.contains('tidal.com')) {
+    return 'Tidal';
+  }
+  if (host.contains('music.apple.com')) {
+    return 'Apple Music';
+  }
+  return uri.host;
+}
+
+String _remoteTrackName(Uri uri) {
+  final lastSegment = uri.pathSegments.isEmpty ? '' : uri.pathSegments.last;
+  final decoded = Uri.decodeComponent(lastSegment).trim();
+  return decoded.ifEmpty(uri.host);
+}
+
+class MusicLinkResolverException implements Exception {
+  const MusicLinkResolverException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
 }
 
 class BootstrapShell extends StatelessWidget {
@@ -1596,6 +1855,7 @@ class SessionShell extends StatefulWidget {
   const SessionShell({
     required this.imagePicker,
     required this.trackPicker,
+    required this.trackLinkResolver,
     required this.audioService,
     required this.musicPlaybackService,
     required this.diceRoller,
@@ -1608,6 +1868,7 @@ class SessionShell extends StatefulWidget {
 
   final ChatImagePicker imagePicker;
   final AudioTrackPicker trackPicker;
+  final AudioTrackLinkResolver trackLinkResolver;
   final AudioControlService audioService;
   final MusicPlaybackService musicPlaybackService;
   final DiceRoller diceRoller;
@@ -1655,6 +1916,7 @@ class _SessionShellState extends State<SessionShell> {
       SoundtrackPlaybackSnapshot.idle();
   bool _isPickingImage = false;
   bool _isPickingTrack = false;
+  bool _isResolvingTrackLink = false;
   bool _isAudioBusy = false;
   bool _isMusicBusy = false;
   bool _isBotPlaying = false;
@@ -1669,7 +1931,9 @@ class _SessionShellState extends State<SessionShell> {
   void initState() {
     super.initState();
     _soundtrackSnapshot = widget.musicPlaybackService.snapshot;
-    _soundtrackSubscription = widget.musicPlaybackService.changes.listen((state) {
+    _soundtrackSubscription = widget.musicPlaybackService.changes.listen((
+      state,
+    ) {
       if (!mounted) {
         return;
       }
@@ -1948,6 +2212,7 @@ class _SessionShellState extends State<SessionShell> {
         id: 'track-${DateTime.now().microsecondsSinceEpoch}',
         name: selected.name,
         path: selected.path,
+        source: selected.source,
       );
 
       setState(() {
@@ -1961,6 +2226,68 @@ class _SessionShellState extends State<SessionShell> {
         });
       }
     }
+  }
+
+  Future<void> _addSoundtrackLink() async {
+    if (_isResolvingTrackLink) {
+      return;
+    }
+
+    final link = await _requestSoundtrackLink();
+    if (link == null || link.trim().isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _isResolvingTrackLink = true;
+    });
+
+    try {
+      final selected = await widget.trackLinkResolver(link);
+      if (!mounted || selected == null) {
+        return;
+      }
+
+      final track = LocalSoundtrackTrack(
+        id: 'track-${DateTime.now().microsecondsSinceEpoch}',
+        name: selected.name,
+        path: selected.path,
+        source: selected.source,
+      );
+
+      setState(() {
+        _soundtracks.insert(0, track);
+        _selectedTrackId = track.id;
+        _soundtrackSnapshot = _soundtrackSnapshot.copyWith(error: null);
+      });
+    } on MusicLinkResolverException catch (error) {
+      _setMusicError(error.message);
+    } catch (error) {
+      _setMusicError(error.toString());
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isResolvingTrackLink = false;
+        });
+      }
+    }
+  }
+
+  Future<String?> _requestSoundtrackLink() async {
+    return showDialog<String>(
+      context: context,
+      builder: (context) => const SoundtrackLinkDialog(),
+    );
+  }
+
+  void _setMusicError(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _soundtrackSnapshot = _soundtrackSnapshot.copyWith(error: message);
+    });
   }
 
   void _selectTrack(String trackId) {
@@ -1982,7 +2309,9 @@ class _SessionShellState extends State<SessionShell> {
     if (track == null || _isMusicBusy) {
       return;
     }
-    await _runMusicAction(() => widget.musicPlaybackService.previewTrack(track));
+    await _runMusicAction(
+      () => widget.musicPlaybackService.previewTrack(track),
+    );
   }
 
   Future<void> _playTrack() async {
@@ -1991,6 +2320,16 @@ class _SessionShellState extends State<SessionShell> {
       return;
     }
     await _runMusicAction(() => widget.musicPlaybackService.playTrack(track));
+  }
+
+  Future<void> _enqueueTrack() async {
+    final track = _selectedTrack;
+    if (track == null || _isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(
+      () => widget.musicPlaybackService.enqueueTrack(track),
+    );
   }
 
   Future<void> _pauseTrack() async {
@@ -2014,6 +2353,20 @@ class _SessionShellState extends State<SessionShell> {
     await _runMusicAction(widget.musicPlaybackService.stop);
   }
 
+  Future<void> _skipTrack() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(widget.musicPlaybackService.skip);
+  }
+
+  Future<void> _clearMusicQueue() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(widget.musicPlaybackService.clearQueue);
+  }
+
   Future<void> _toggleTrackLoop() async {
     if (_isMusicBusy) {
       return;
@@ -2021,6 +2374,17 @@ class _SessionShellState extends State<SessionShell> {
     await _runMusicAction(
       () => widget.musicPlaybackService.setLoopEnabled(
         !_soundtrackSnapshot.isLoopEnabled,
+      ),
+    );
+  }
+
+  Future<void> _toggleQueueLoop() async {
+    if (_isMusicBusy) {
+      return;
+    }
+    await _runMusicAction(
+      () => widget.musicPlaybackService.setQueueLoopEnabled(
+        !_soundtrackSnapshot.isQueueLoopEnabled,
       ),
     );
   }
@@ -2162,14 +2526,20 @@ class _SessionShellState extends State<SessionShell> {
                               soundtrackSnapshot: _soundtrackSnapshot,
                               isMusicBusy: _isMusicBusy,
                               isPickingTrack: _isPickingTrack,
+                              isResolvingTrackLink: _isResolvingTrackLink,
                               onAddTrack: _addSoundtrack,
+                              onAddTrackLink: _addSoundtrackLink,
                               onSelectTrack: _selectTrack,
                               onPreviewTrack: _previewTrack,
                               onPlayTrack: _playTrack,
+                              onEnqueueTrack: _enqueueTrack,
                               onResumeTrack: _resumeTrack,
                               onPauseTrack: _pauseTrack,
                               onStopTrack: _stopTrack,
+                              onSkipTrack: _skipTrack,
+                              onClearQueue: _clearMusicQueue,
                               onToggleTrackLoop: _toggleTrackLoop,
+                              onToggleQueueLoop: _toggleQueueLoop,
                             );
                           }
 
@@ -2200,14 +2570,20 @@ class _SessionShellState extends State<SessionShell> {
                             soundtrackSnapshot: _soundtrackSnapshot,
                             isMusicBusy: _isMusicBusy,
                             isPickingTrack: _isPickingTrack,
+                            isResolvingTrackLink: _isResolvingTrackLink,
                             onAddTrack: _addSoundtrack,
+                            onAddTrackLink: _addSoundtrackLink,
                             onSelectTrack: _selectTrack,
                             onPreviewTrack: _previewTrack,
                             onPlayTrack: _playTrack,
+                            onEnqueueTrack: _enqueueTrack,
                             onResumeTrack: _resumeTrack,
                             onPauseTrack: _pauseTrack,
                             onStopTrack: _stopTrack,
+                            onSkipTrack: _skipTrack,
+                            onClearQueue: _clearMusicQueue,
                             onToggleTrackLoop: _toggleTrackLoop,
+                            onToggleQueueLoop: _toggleQueueLoop,
                           );
                         },
                       ),
@@ -2251,14 +2627,20 @@ class WideSessionLayout extends StatelessWidget {
     required this.soundtrackSnapshot,
     required this.isMusicBusy,
     required this.isPickingTrack,
+    required this.isResolvingTrackLink,
     required this.onAddTrack,
+    required this.onAddTrackLink,
     required this.onSelectTrack,
     required this.onPreviewTrack,
     required this.onPlayTrack,
+    required this.onEnqueueTrack,
     required this.onResumeTrack,
     required this.onPauseTrack,
     required this.onStopTrack,
+    required this.onSkipTrack,
+    required this.onClearQueue,
     required this.onToggleTrackLoop,
+    required this.onToggleQueueLoop,
     super.key,
   });
 
@@ -2288,14 +2670,20 @@ class WideSessionLayout extends StatelessWidget {
   final SoundtrackPlaybackSnapshot soundtrackSnapshot;
   final bool isMusicBusy;
   final bool isPickingTrack;
+  final bool isResolvingTrackLink;
   final Future<void> Function() onAddTrack;
+  final Future<void> Function() onAddTrackLink;
   final ValueChanged<String> onSelectTrack;
   final Future<void> Function() onPreviewTrack;
   final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onEnqueueTrack;
   final Future<void> Function() onResumeTrack;
   final Future<void> Function() onPauseTrack;
   final Future<void> Function() onStopTrack;
+  final Future<void> Function() onSkipTrack;
+  final Future<void> Function() onClearQueue;
   final Future<void> Function() onToggleTrackLoop;
+  final Future<void> Function() onToggleQueueLoop;
 
   @override
   Widget build(BuildContext context) {
@@ -2340,14 +2728,20 @@ class WideSessionLayout extends StatelessWidget {
             soundtrackSnapshot: soundtrackSnapshot,
             isMusicBusy: isMusicBusy,
             isPickingTrack: isPickingTrack,
+            isResolvingTrackLink: isResolvingTrackLink,
             onAddTrack: onAddTrack,
+            onAddTrackLink: onAddTrackLink,
             onSelectTrack: onSelectTrack,
             onPreviewTrack: onPreviewTrack,
             onPlayTrack: onPlayTrack,
+            onEnqueueTrack: onEnqueueTrack,
             onResumeTrack: onResumeTrack,
             onPauseTrack: onPauseTrack,
             onStopTrack: onStopTrack,
+            onSkipTrack: onSkipTrack,
+            onClearQueue: onClearQueue,
             onToggleTrackLoop: onToggleTrackLoop,
+            onToggleQueueLoop: onToggleQueueLoop,
             diceHistory: diceHistory,
             onDiceSubmitted: onDiceSubmitted,
             onClearDiceHistory: onClearDiceHistory,
@@ -2386,14 +2780,20 @@ class CompactSessionLayout extends StatelessWidget {
     required this.soundtrackSnapshot,
     required this.isMusicBusy,
     required this.isPickingTrack,
+    required this.isResolvingTrackLink,
     required this.onAddTrack,
+    required this.onAddTrackLink,
     required this.onSelectTrack,
     required this.onPreviewTrack,
     required this.onPlayTrack,
+    required this.onEnqueueTrack,
     required this.onResumeTrack,
     required this.onPauseTrack,
     required this.onStopTrack,
+    required this.onSkipTrack,
+    required this.onClearQueue,
     required this.onToggleTrackLoop,
+    required this.onToggleQueueLoop,
     super.key,
   });
 
@@ -2423,14 +2823,20 @@ class CompactSessionLayout extends StatelessWidget {
   final SoundtrackPlaybackSnapshot soundtrackSnapshot;
   final bool isMusicBusy;
   final bool isPickingTrack;
+  final bool isResolvingTrackLink;
   final Future<void> Function() onAddTrack;
+  final Future<void> Function() onAddTrackLink;
   final ValueChanged<String> onSelectTrack;
   final Future<void> Function() onPreviewTrack;
   final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onEnqueueTrack;
   final Future<void> Function() onResumeTrack;
   final Future<void> Function() onPauseTrack;
   final Future<void> Function() onStopTrack;
+  final Future<void> Function() onSkipTrack;
+  final Future<void> Function() onClearQueue;
   final Future<void> Function() onToggleTrackLoop;
+  final Future<void> Function() onToggleQueueLoop;
 
   @override
   Widget build(BuildContext context) {
@@ -2477,14 +2883,20 @@ class CompactSessionLayout extends StatelessWidget {
                   soundtrackSnapshot: soundtrackSnapshot,
                   isMusicBusy: isMusicBusy,
                   isPickingTrack: isPickingTrack,
+                  isResolvingTrackLink: isResolvingTrackLink,
                   onAddTrack: onAddTrack,
+                  onAddTrackLink: onAddTrackLink,
                   onSelectTrack: onSelectTrack,
                   onPreviewTrack: onPreviewTrack,
                   onPlayTrack: onPlayTrack,
+                  onEnqueueTrack: onEnqueueTrack,
                   onResumeTrack: onResumeTrack,
                   onPauseTrack: onPauseTrack,
                   onStopTrack: onStopTrack,
+                  onSkipTrack: onSkipTrack,
+                  onClearQueue: onClearQueue,
                   onToggleTrackLoop: onToggleTrackLoop,
+                  onToggleQueueLoop: onToggleQueueLoop,
                   diceHistory: diceHistory,
                   onDiceSubmitted: onDiceSubmitted,
                   onClearDiceHistory: onClearDiceHistory,
@@ -3646,14 +4058,20 @@ class SideToolsPanel extends StatelessWidget {
     required this.soundtrackSnapshot,
     required this.isMusicBusy,
     required this.isPickingTrack,
+    required this.isResolvingTrackLink,
     required this.onAddTrack,
+    required this.onAddTrackLink,
     required this.onSelectTrack,
     required this.onPreviewTrack,
     required this.onPlayTrack,
+    required this.onEnqueueTrack,
     required this.onResumeTrack,
     required this.onPauseTrack,
     required this.onStopTrack,
+    required this.onSkipTrack,
+    required this.onClearQueue,
     required this.onToggleTrackLoop,
+    required this.onToggleQueueLoop,
     required this.diceHistory,
     required this.onDiceSubmitted,
     required this.onClearDiceHistory,
@@ -3667,14 +4085,20 @@ class SideToolsPanel extends StatelessWidget {
   final SoundtrackPlaybackSnapshot soundtrackSnapshot;
   final bool isMusicBusy;
   final bool isPickingTrack;
+  final bool isResolvingTrackLink;
   final Future<void> Function() onAddTrack;
+  final Future<void> Function() onAddTrackLink;
   final ValueChanged<String> onSelectTrack;
   final Future<void> Function() onPreviewTrack;
   final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onEnqueueTrack;
   final Future<void> Function() onResumeTrack;
   final Future<void> Function() onPauseTrack;
   final Future<void> Function() onStopTrack;
+  final Future<void> Function() onSkipTrack;
+  final Future<void> Function() onClearQueue;
   final Future<void> Function() onToggleTrackLoop;
+  final Future<void> Function() onToggleQueueLoop;
   final List<DiceRollRecord> diceHistory;
   final DiceRollRecord Function(String expression) onDiceSubmitted;
   final VoidCallback onClearDiceHistory;
@@ -3691,14 +4115,20 @@ class SideToolsPanel extends StatelessWidget {
             snapshot: soundtrackSnapshot,
             isBusy: isMusicBusy,
             isPickingTrack: isPickingTrack,
+            isResolvingTrackLink: isResolvingTrackLink,
             onAddTrack: onAddTrack,
+            onAddTrackLink: onAddTrackLink,
             onSelectTrack: onSelectTrack,
             onPreviewTrack: onPreviewTrack,
             onPlayTrack: onPlayTrack,
+            onEnqueueTrack: onEnqueueTrack,
             onResumeTrack: onResumeTrack,
             onPauseTrack: onPauseTrack,
             onStopTrack: onStopTrack,
+            onSkipTrack: onSkipTrack,
+            onClearQueue: onClearQueue,
             onToggleTrackLoop: onToggleTrackLoop,
+            onToggleQueueLoop: onToggleQueueLoop,
           ),
         ),
         const SizedBox(height: 12),
@@ -3730,14 +4160,20 @@ class MusicPanel extends StatelessWidget {
     required this.snapshot,
     required this.isBusy,
     required this.isPickingTrack,
+    required this.isResolvingTrackLink,
     required this.onAddTrack,
+    required this.onAddTrackLink,
     required this.onSelectTrack,
     required this.onPreviewTrack,
     required this.onPlayTrack,
+    required this.onEnqueueTrack,
     required this.onResumeTrack,
     required this.onPauseTrack,
     required this.onStopTrack,
+    required this.onSkipTrack,
+    required this.onClearQueue,
     required this.onToggleTrackLoop,
+    required this.onToggleQueueLoop,
     super.key,
   });
 
@@ -3746,14 +4182,20 @@ class MusicPanel extends StatelessWidget {
   final SoundtrackPlaybackSnapshot snapshot;
   final bool isBusy;
   final bool isPickingTrack;
+  final bool isResolvingTrackLink;
   final Future<void> Function() onAddTrack;
+  final Future<void> Function() onAddTrackLink;
   final ValueChanged<String> onSelectTrack;
   final Future<void> Function() onPreviewTrack;
   final Future<void> Function() onPlayTrack;
+  final Future<void> Function() onEnqueueTrack;
   final Future<void> Function() onResumeTrack;
   final Future<void> Function() onPauseTrack;
   final Future<void> Function() onStopTrack;
+  final Future<void> Function() onSkipTrack;
+  final Future<void> Function() onClearQueue;
   final Future<void> Function() onToggleTrackLoop;
+  final Future<void> Function() onToggleQueueLoop;
 
   @override
   Widget build(BuildContext context) {
@@ -3766,10 +4208,21 @@ class MusicPanel extends StatelessWidget {
 
     return Panel(
       title: 'Trilha',
-      trailing: IconToolButton(
-        icon: Icons.playlist_add,
-        label: 'Adicionar trilha',
-        onPressed: isPickingTrack ? null : onAddTrack,
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconToolButton(
+            icon: Icons.link,
+            label: 'Adicionar link',
+            onPressed: isResolvingTrackLink ? null : onAddTrackLink,
+          ),
+          const SizedBox(width: 8),
+          IconToolButton(
+            icon: Icons.playlist_add,
+            label: 'Adicionar trilha',
+            onPressed: isPickingTrack ? null : onAddTrack,
+          ),
+        ],
       ),
       child: SingleChildScrollView(
         child: Column(
@@ -3786,10 +4239,12 @@ class MusicPanel extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    activeTrack?.name ?? selectedTrack?.name ?? 'Nenhuma trilha',
+                    activeTrack?.name ??
+                        selectedTrack?.name ??
+                        'Nenhuma trilha',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontWeight: FontWeight.w800),
+                    style: const TextStyle(fontWeight: FontWeight.w800),
                   ),
                   const SizedBox(height: 6),
                   LinearProgressIndicator(
@@ -3800,6 +4255,14 @@ class MusicPanel extends StatelessWidget {
                   Text(
                     '${snapshot.scopeLabel}  ${formatDuration(snapshot.position)} / ${formatDuration(snapshot.duration)}',
                     style: const TextStyle(fontSize: 12),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    snapshot.queueLabel,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFFAEB8B5),
+                    ),
                   ),
                 ],
               ),
@@ -3824,21 +4287,65 @@ class MusicPanel extends StatelessWidget {
                 ),
                 const SizedBox(width: 8),
                 IconToolButton(
+                  icon: Icons.queue_music,
+                  label: 'Adicionar a fila',
+                  onPressed: tracks.isEmpty || isBusy ? null : onEnqueueTrack,
+                ),
+                const SizedBox(width: 8),
+                IconToolButton(
                   icon: Icons.pause,
                   label: 'Pausar',
-                  onPressed: !snapshot.isPlaying || isBusy ? null : onPauseTrack,
+                  onPressed: !snapshot.isPlaying || isBusy
+                      ? null
+                      : onPauseTrack,
                 ),
                 const SizedBox(width: 8),
                 IconToolButton(
                   icon: Icons.stop,
                   label: 'Parar',
-                  onPressed: !snapshot.hasActiveTrack || isBusy ? null : onStopTrack,
+                  onPressed: !snapshot.hasActiveTrack || isBusy
+                      ? null
+                      : onStopTrack,
                 ),
                 const SizedBox(width: 8),
                 IconToolButton(
-                  icon: snapshot.isLoopEnabled ? Icons.repeat_one : Icons.repeat,
-                  label: 'Loop simples',
-                  onPressed: tracks.isEmpty || isBusy ? null : onToggleTrackLoop,
+                  icon: Icons.skip_next,
+                  label: 'Pular',
+                  onPressed: !snapshot.hasActiveTrack || isBusy
+                      ? null
+                      : onSkipTrack,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                IconToolButton(
+                  icon: Icons.clear_all,
+                  label: 'Limpar fila',
+                  onPressed: snapshot.upcomingTrackCount == 0 || isBusy
+                      ? null
+                      : onClearQueue,
+                ),
+                const SizedBox(width: 8),
+                IconToolButton(
+                  icon: snapshot.isLoopEnabled
+                      ? Icons.repeat_one
+                      : Icons.repeat,
+                  label: 'Loop da faixa',
+                  onPressed: tracks.isEmpty || isBusy
+                      ? null
+                      : onToggleTrackLoop,
+                ),
+                const SizedBox(width: 8),
+                IconToolButton(
+                  icon: snapshot.isQueueLoopEnabled
+                      ? Icons.repeat_on
+                      : Icons.repeat,
+                  label: 'Loop da fila',
+                  onPressed: tracks.isEmpty || isBusy
+                      ? null
+                      : onToggleQueueLoop,
                 ),
               ],
             ),
@@ -3859,7 +4366,7 @@ class MusicPanel extends StatelessWidget {
                       active: tracks[index].id == snapshot.activeTrackId,
                       subtitle: tracks[index].id == snapshot.activeTrackId
                           ? snapshot.scopeLabel
-                          : 'Arquivo local',
+                          : _queueSubtitle(tracks[index], snapshot),
                       onTap: () => onSelectTrack(tracks[index].id),
                     ),
                     if (index != tracks.length - 1) const SizedBox(height: 8),
@@ -3870,6 +4377,23 @@ class MusicPanel extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  String _queueSubtitle(
+    LocalSoundtrackTrack track,
+    SoundtrackPlaybackSnapshot snapshot,
+  ) {
+    final queueIndex = snapshot.queueTrackIds.indexOf(track.id);
+    if (queueIndex == -1) {
+      return track.sourceLabel;
+    }
+
+    if (snapshot.activeQueueIndex >= 0 &&
+        queueIndex < snapshot.activeQueueIndex) {
+      return 'Ja tocada nesta fila';
+    }
+
+    return 'Fila #${queueIndex + 1}';
   }
 }
 
@@ -3937,6 +4461,50 @@ class TrackTile extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class SoundtrackLinkDialog extends StatefulWidget {
+  const SoundtrackLinkDialog({super.key});
+
+  @override
+  State<SoundtrackLinkDialog> createState() => _SoundtrackLinkDialogState();
+}
+
+class _SoundtrackLinkDialogState extends State<SoundtrackLinkDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.of(context).pop(_controller.text);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Adicionar link'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        keyboardType: TextInputType.url,
+        decoration: const InputDecoration(
+          hintText: 'https://servidor/audio.mp3',
+        ),
+        onSubmitted: (_) => _submit(),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancelar'),
+        ),
+        FilledButton(onPressed: _submit, child: const Text('Adicionar')),
+      ],
     );
   }
 }
@@ -5120,14 +5688,18 @@ class SelectedChatImage {
   final Uint8List bytes;
 }
 
+enum AudioTrackSource { localFile, remoteUrl }
+
 class SelectedAudioTrack {
   const SelectedAudioTrack({
     required this.name,
     required this.path,
+    this.source = AudioTrackSource.localFile,
   });
 
   final String name;
   final String path;
+  final AudioTrackSource source;
 }
 
 class LocalSoundtrackTrack {
@@ -5135,11 +5707,18 @@ class LocalSoundtrackTrack {
     required this.id,
     required this.name,
     required this.path,
+    this.source = AudioTrackSource.localFile,
   });
 
   final String id;
   final String name;
   final String path;
+  final AudioTrackSource source;
+
+  String get sourceLabel => switch (source) {
+    AudioTrackSource.localFile => 'Arquivo local',
+    AudioTrackSource.remoteUrl => 'Link remoto',
+  };
 }
 
 String sanitizeObsidianMarkdown(String markdown) {
