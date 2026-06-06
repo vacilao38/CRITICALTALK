@@ -6,7 +6,7 @@ Este documento prepara a instalacao das dependencias de desenvolvimento do Criti
 
 - Flutter/Dart para cliente Android e Linux desktop.
 - Ferramentas nativas para build Linux: clang, cmake, ninja, pkg-config e GTK.
-- Bibliotecas de desenvolvimento de audio para Linux: ALSA, PulseAudio, WebRTC Audio Processing e PortAudio.
+- Bibliotecas de desenvolvimento de audio para Linux: ALSA, PulseAudio, GStreamer, WebRTC Audio Processing e PortAudio.
 - Java 17 para toolchain Android.
 - Node.js 20 e npm para backend, scripts e ferramentas auxiliares.
 - Docker e docker-compose para infraestrutura local.
@@ -45,6 +45,7 @@ psql --version
 - Android Studio ou Android SDK ainda podem ser necessarios para builds Android completos.
 - Como ainda nao existe codigo do app, ainda nao ha dependencias de projeto como `flutter pub get` ou `npm install`.
 - Para a etapa de voz no Linux, os headers `libasound2-dev` e `libpulse-dev` sao especialmente importantes.
+- Para a etapa 1 de trilha sonora local no Linux, `libgstreamer1.0-dev` e `libgstreamer-plugins-base1.0-dev` sao necessarios para o plugin `audioplayers_linux`.
 
 ## Proximo passo apos instalar
 

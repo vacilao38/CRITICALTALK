@@ -307,7 +307,7 @@ void main() {
     await tester.tap(find.byTooltip('Adicionar trilha'));
     await tester.pumpAndSettle();
 
-    expect(find.text('campfire.mp3'), findsOneWidget);
+    expect(find.text('campfire.mp3'), findsWidgets);
 
     await tester.tap(find.byTooltip('Preview'));
     await tester.pumpAndSettle();

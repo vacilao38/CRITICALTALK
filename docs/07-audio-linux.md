@@ -19,6 +19,8 @@ Nao estavam instalados quando o ambiente foi auditado:
 
 - `libasound2-dev`;
 - `libpulse-dev`;
+- `libgstreamer1.0-dev`;
+- `libgstreamer-plugins-base1.0-dev`;
 - `portaudio19-dev`;
 - `libwebrtc-audio-processing-dev`.
 
@@ -31,8 +33,25 @@ Nao estavam instalados quando o ambiente foi auditado:
 
 ### Recomendado para laboratorio e futuras iteracoes
 
+- `libgstreamer1.0-dev`;
+- `libgstreamer-plugins-base1.0-dev`;
 - `portaudio19-dev`;
 - `libwebrtc-audio-processing-dev`.
+
+## Observacao importante para trilha sonora local
+
+O plugin Linux usado na etapa 1 de trilha sonora local depende de:
+
+- `gstreamer-1.0`;
+- `gstreamer-app-1.0`;
+- `gstreamer-audio-1.0`.
+
+Na pratica, isso significa instalar os headers:
+
+- `libgstreamer1.0-dev`;
+- `libgstreamer-plugins-base1.0-dev`.
+
+Sem esses pacotes, o `flutter build linux` falha durante o CMake do `audioplayers_linux`.
 
 ## Ferramentas de verificacao uteis
 

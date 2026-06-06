@@ -19,6 +19,8 @@ apt-get install -y \
   git \
   libasound2-dev \
   libglu1-mesa \
+  libgstreamer-plugins-base1.0-dev \
+  libgstreamer1.0-dev \
   libgtk-3-dev \
   libpulse-dev \
   libwebrtc-audio-processing-dev \
